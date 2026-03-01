@@ -4946,8 +4946,20 @@ impl Tool for HashlineEditTool {
         }
 
         // Read file content
-        let raw_content = std::fs::read_to_string(&absolute_path)
+        let file = std::fs::File::open(&absolute_path)
+            .map_err(|e| Error::tool("hashline_edit", format!("Cannot open file: {e}")))?;
+        let mut raw_content = String::new();
+        use std::io::Read;
+        file.take(READ_TOOL_MAX_BYTES.saturating_add(1))
+            .read_to_string(&mut raw_content)
             .map_err(|e| Error::tool("hashline_edit", format!("Cannot read file: {e}")))?;
+
+        if raw_content.len() as u64 > READ_TOOL_MAX_BYTES {
+            return Err(Error::tool(
+                "hashline_edit",
+                format!("File too large (> {} bytes)", READ_TOOL_MAX_BYTES),
+            ));
+        }
 
         let (content_no_bom, had_bom) = strip_bom(&raw_content);
         let original_ending = detect_line_ending(content_no_bom);
@@ -5036,10 +5048,15 @@ impl Tool for HashlineEditTool {
                             .map_err(|e| Error::tool("hashline_edit", e))?,
                         None => 0, // BOF
                     };
+                    let end_idx = if file_lines == [""] && edit.pos.is_none() {
+                        0 // replace the empty line
+                    } else {
+                        idx
+                    };
                     resolved.push(ResolvedEdit {
-                        op: "prepend",
+                        op: if file_lines == [""] && edit.pos.is_none() { "replace" } else { "prepend" },
                         start: idx,
-                        end: idx,
+                        end: end_idx,
                         lines: replacement_lines,
                     });
                 }
@@ -5047,12 +5064,23 @@ impl Tool for HashlineEditTool {
                     let idx = match &edit.pos {
                         Some(pos) => validate_line_ref(pos, &file_lines)
                             .map_err(|e| Error::tool("hashline_edit", e))?,
-                        None => file_lines.len().saturating_sub(1), // EOF
+                        None => {
+                            if file_lines.len() > 1 && file_lines.last() == Some(&"") {
+                                file_lines.len() - 2
+                            } else {
+                                file_lines.len().saturating_sub(1)
+                            }
+                        }
+                    };
+                    let end_idx = if file_lines == [""] && edit.pos.is_none() {
+                        0 // replace the empty line
+                    } else {
+                        idx
                     };
                     resolved.push(ResolvedEdit {
-                        op: "append",
+                        op: if file_lines == [""] && edit.pos.is_none() { "replace" } else { "append" },
                         start: idx,
-                        end: idx,
+                        end: end_idx,
                         lines: replacement_lines,
                     });
                 }
