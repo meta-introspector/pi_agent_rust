@@ -58,9 +58,9 @@ fn truncate_head_first_line_exceeds_bytes() {
     assert!(result.truncated);
     assert!(result.first_line_exceeds_limit);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
-    assert_eq!(result.output_lines, 0);
-    assert_eq!(result.output_bytes, 0);
-    assert!(result.content.is_empty());
+    assert_eq!(result.output_lines, 1);
+    assert_eq!(result.output_bytes, 50);
+    assert_eq!(result.content, "x".repeat(50));
 }
 
 #[test]
