@@ -4494,7 +4494,8 @@ fn kill_process_tree_with(pid: Option<u32>, signal: sysinfo::Signal) {
     }
 
     let mut to_kill = Vec::new();
-    collect_process_tree(root, &children_map, &mut to_kill);
+    let mut visited = std::collections::HashSet::new();
+    collect_process_tree(root, &children_map, &mut to_kill, &mut visited);
 
     // Kill children first.
     for pid in to_kill.into_iter().rev() {
@@ -4513,11 +4514,15 @@ fn collect_process_tree(
     pid: sysinfo::Pid,
     children_map: &HashMap<sysinfo::Pid, Vec<sysinfo::Pid>>,
     out: &mut Vec<sysinfo::Pid>,
+    visited: &mut std::collections::HashSet<sysinfo::Pid>,
 ) {
+    if !visited.insert(pid) {
+        return;
+    }
     out.push(pid);
     if let Some(children) = children_map.get(&pid) {
         for child in children {
-            collect_process_tree(*child, children_map, out);
+            collect_process_tree(*child, children_map, out, visited);
         }
     }
 }
