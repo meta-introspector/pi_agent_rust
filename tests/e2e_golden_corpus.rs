@@ -223,6 +223,14 @@ impl GoldenTestHarness {
 
         let start = Instant::now();
         let mut command = Command::new(&self.binary_path);
+        command.env_remove("ANTHROPIC_API_KEY");
+        command.env_remove("OPENAI_API_KEY");
+        command.env_remove("GEMINI_API_KEY");
+        command.env_remove("GROQ_API_KEY");
+        command.env_remove("KIMI_API_KEY");
+        command.env_remove("AZURE_OPENAI_API_KEY");
+        command.env_remove("PI_OPENROUTER_API_KEY");
+        command.env_remove("PI_AWS_ACCESS_KEY_ID");
         command
             .args(args)
             .envs(self.env.clone())

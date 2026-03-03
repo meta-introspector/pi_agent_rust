@@ -218,6 +218,14 @@ fn run_cli(
         .info("action", format!("Running CLI: {}", args.join(" ")));
 
     let mut command = Command::new(cli_binary_path());
+    command.env_remove("ANTHROPIC_API_KEY");
+    command.env_remove("OPENAI_API_KEY");
+    command.env_remove("GEMINI_API_KEY");
+    command.env_remove("GROQ_API_KEY");
+    command.env_remove("KIMI_API_KEY");
+    command.env_remove("AZURE_OPENAI_API_KEY");
+    command.env_remove("PI_OPENROUTER_API_KEY");
+    command.env_remove("PI_AWS_ACCESS_KEY_ID");
     command
         .args(args)
         .envs(env.clone())

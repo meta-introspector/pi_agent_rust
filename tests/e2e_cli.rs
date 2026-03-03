@@ -62,6 +62,10 @@ impl CliTestHarness {
 
         // Fully isolate global/project state for determinism.
         env.insert(
+            "HOME".to_string(),
+            env_root.join("home").display().to_string(),
+        );
+        env.insert(
             "PI_CODING_AGENT_DIR".to_string(),
             env_root.join("agent").display().to_string(),
         );
@@ -156,6 +160,7 @@ impl CliTestHarness {
             )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run_with_stdin(&self, args: &[&str], stdin: Option<&[u8]>) -> CliResult {
         self.harness
             .log()
@@ -401,6 +406,7 @@ fn count_jsonl_files(path: &Path) -> usize {
             .and_then(OsStr::to_str)
             .is_some_and(|ext| ext == "jsonl")
         {
+            println!("FOUND JSONL: {}", entry_path.display());
             count += 1;
         }
     }
@@ -2035,7 +2041,7 @@ fn e2e_cli_theme_flag_valid_builtin() {
 #[test]
 fn e2e_cli_theme_flag_invalid_path() {
     let harness = CliTestHarness::new("e2e_cli_theme_flag_invalid_path");
-    let result = harness.run(&["--theme", "nonexistent.json", "--version"]);
+    let result = harness.run(&["--theme", "nonexistent.json", "hello"]);
     assert_exit_code(&harness.harness, &result, 2);
     let combined = format!("{}\n{}", result.stdout, result.stderr);
     assert_contains_case_insensitive(&harness.harness, &combined, "theme file not found");
@@ -2975,7 +2981,7 @@ fn e2e_cli_specific_tools_enables_subset() {
 fn e2e_cli_default_tools_when_no_flag() {
     let mut harness = CliTestHarness::new("e2e_cli_default_tools_when_no_flag");
     let system_prompt = "Test default tools.";
-    let expected_tools = ["read", "bash", "edit", "write"];
+    let expected_tools = ["read", "bash", "edit", "write", "hashline_edit"];
 
     let request_body = json!({
         "model": "claude-sonnet-4-5",
