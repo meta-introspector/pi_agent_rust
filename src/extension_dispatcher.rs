@@ -3519,11 +3519,16 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             })
             .await?;
 
-        let start = Instant::now();
+        let start = Cx::current()
+            .and_then(|cx| cx.timer_driver())
+            .map_or_else(wall_now, |t| t.now());
         let timeout = Duration::from_millis(timeout_ms.max(1));
 
         loop {
-            if start.elapsed() > timeout {
+            let now = Cx::current()
+                .and_then(|cx| cx.timer_driver())
+                .map_or_else(wall_now, |t| t.now());
+            if std::time::Duration::from_millis(now.duration_since(start)) > timeout {
                 return Err(crate::error::Error::extension(format!(
                     "events.emit timed out after {}ms",
                     timeout.as_millis()
@@ -3893,7 +3898,7 @@ mod tests {
         ) -> Result<()> {
             self.custom_entries
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((custom_type, data));
             Ok(())
         }
@@ -4366,6 +4371,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn dispatcher_session_hostcall_append_message_and_entry() {
         futures::executor::block_on(async {
             let runtime = Rc::new(
