@@ -19019,12 +19019,16 @@ fn is_likely_flat_extension_entry(path: &Path) -> bool {
         || has_registration
 }
 
+const FLAT_EXTENSION_INITIALIZER_NAMES: &str =
+    r"(?:activate|init(?:ialize)?|setup|register|plugin|main)";
+
 fn named_flat_extension_initializer_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r"(?m)\bexport\s+(?:async\s+)?function\s+(?:activate|init(?:ialize)?|setup|register|plugin|main)\b|\bexport\s+(?:const|let|var)\s+(?:activate|init(?:ialize)?|setup|register|plugin|main)\b",
-        )
+        Regex::new(&format!(
+            r"(?m)\bexport\s+(?:async\s+)?function\s+{names}\b|\bexport\s+(?:const|let|var)\s+{names}\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)",
+            names = FLAT_EXTENSION_INITIALIZER_NAMES
+        ))
         .expect("named flat extension initializer regex")
     })
 }
@@ -19032,9 +19036,10 @@ fn named_flat_extension_initializer_regex() -> &'static Regex {
 fn default_object_flat_extension_initializer_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r"(?ms)\bexport\s+default\s*\{.*?\b(?:activate|init(?:ialize)?|setup|register|plugin|main)\s*(?:[:(])",
-        )
+        Regex::new(&format!(
+            r#"(?ms)\bexport\s+default\s*\{{.*?(?:\b(?:async\s+)?{names}\s*\(|\b{names}\s*:\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)|["'`]{names}["'`]\s*(?:\(|:\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)))"#,
+            names = FLAT_EXTENSION_INITIALIZER_NAMES
+        ))
         .expect("default object flat extension initializer regex")
     })
 }
@@ -28986,6 +28991,77 @@ mod tests {
     }
 
     #[test]
+    fn discover_related_extension_entries_includes_quoted_default_object_initializer_siblings() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("quoted-default-object");
+        std::fs::create_dir_all(&root).expect("mkdir quoted-default-object");
+
+        let alpha = root.join("alpha.ts");
+        let beta = root.join("beta.ts");
+        std::fs::write(&alpha, "export default { activate(_pi) {} };\n").expect("write alpha");
+        std::fs::write(
+            &beta,
+            "export default { \"initialize\": async (_pi) => {} };\n",
+        )
+        .expect("write beta");
+
+        let discovered = discover_related_extension_entries(&alpha);
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered.contains(&safe_canonicalize(&alpha)));
+        assert!(discovered.contains(&safe_canonicalize(&beta)));
+    }
+
+    #[test]
+    fn discover_related_extension_entries_includes_quoted_default_object_method_siblings() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("quoted-default-method");
+        std::fs::create_dir_all(&root).expect("mkdir quoted-default-method");
+
+        let alpha = root.join("alpha.ts");
+        let beta = root.join("beta.ts");
+        std::fs::write(&alpha, "export default { activate(_pi) {} };\n").expect("write alpha");
+        std::fs::write(&beta, "export default { \"initialize\"(_pi) {} };\n").expect("write beta");
+
+        let discovered = discover_related_extension_entries(&alpha);
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered.contains(&safe_canonicalize(&alpha)));
+        assert!(discovered.contains(&safe_canonicalize(&beta)));
+    }
+
+    #[test]
+    fn discover_related_extension_entries_ignores_named_initializer_constants_without_function_values()
+     {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("named-init-constants");
+        std::fs::create_dir_all(&root).expect("mkdir named-init-constants");
+
+        let alpha = root.join("alpha.ts");
+        let helper = root.join("helper.ts");
+        std::fs::write(&alpha, "export async function activate(_pi) {}\n").expect("write alpha");
+        std::fs::write(&helper, "export const initialize = 'not callable';\n")
+            .expect("write helper");
+
+        let discovered = discover_related_extension_entries(&alpha);
+        assert_eq!(discovered, vec![safe_canonicalize(&alpha)]);
+    }
+
+    #[test]
+    fn discover_related_extension_entries_ignores_default_object_initializer_values_without_functions()
+     {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("default-object-values");
+        std::fs::create_dir_all(&root).expect("mkdir default-object-values");
+
+        let alpha = root.join("alpha.ts");
+        let helper = root.join("helper.ts");
+        std::fs::write(&alpha, "export default { activate(_pi) {} };\n").expect("write alpha");
+        std::fs::write(&helper, "export default { initialize: true };\n").expect("write helper");
+
+        let discovered = discover_related_extension_entries(&alpha);
+        assert_eq!(discovered, vec![safe_canonicalize(&alpha)]);
+    }
+
+    #[test]
     fn discover_related_extension_entries_ignores_flat_helper_siblings() {
         let temp = tempdir().expect("tempdir");
         let root = temp.path().join("doom-like");
@@ -29056,7 +29132,10 @@ mod tests {
 
         let discovered = discover_related_extension_entries(&a_index);
         assert!(discovered.contains(&safe_canonicalize(&a_index)));
-        assert!(discovered.contains(&safe_canonicalize(&a_helper)));
+        assert!(
+            !discovered.contains(&safe_canonicalize(&a_helper)),
+            "plain helper modules should not become synthetic extension entrypoints"
+        );
         assert!(
             discovered.contains(&safe_canonicalize(&b_index)),
             "sibling index entries should still be included when local helpers are present"

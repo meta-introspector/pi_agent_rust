@@ -2,7 +2,7 @@
  * DOOM Engine - WebAssembly wrapper for doomgeneric
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +36,15 @@ export class DoomEngine {
 	constructor(wadPath: string, progress?: (message: string) => void) {
 		this.wadPath = wadPath;
 		this.progress = progress;
+		this.debug(`constructor wad=${wadPath}`);
+	}
+
+	private debug(message: string): void {
+		const now = new Date().toISOString();
+		appendFileSync(
+			"/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/doom-overlay/doom-debug.log",
+			`${now} engine ${message}\n`,
+		);
 	}
 
 	get width(): number {
@@ -46,26 +55,35 @@ export class DoomEngine {
 		return this._height;
 	}
 
+	private async yieldAfterProgress(message: string): Promise<void> {
+		this.progress?.(message);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	}
+
 	async init(): Promise<void> {
-		this.progress?.("DOOM init: locating WASM build...");
+		this.debug("init:start");
+		await this.yieldAfterProgress("DOOM init: locating WASM build...");
 		// Locate WASM build
 		const __dirname = dirname(fileURLToPath(import.meta.url));
 		const buildDir = join(__dirname, "doom", "build");
 		const doomJsPath = join(buildDir, "doom.js");
 
 		if (!existsSync(doomJsPath)) {
+			this.debug(`init:missing-js=${doomJsPath}`);
 			throw new Error(`WASM not found at ${doomJsPath}. Run ./doom/build.sh first`);
 		}
 
-		this.progress?.("DOOM init: reading WAD file...");
+		await this.yieldAfterProgress("DOOM init: reading WAD file...");
 		// Read WAD file
 		const wadData = readFileSync(this.wadPath);
 		const wadArray = Array.from(new Uint8Array(wadData));
-		this.progress?.(`DOOM init: WAD loaded (${wadArray.length} bytes)`);
+		this.debug(`init:wad-bytes=${wadArray.length}`);
+		await this.yieldAfterProgress(`DOOM init: WAD loaded (${wadArray.length} bytes)`);
 
-		this.progress?.("DOOM init: loading generated JS glue...");
+		await this.yieldAfterProgress("DOOM init: loading generated JS glue...");
 		// Load WASM module - eval to bypass jiti completely
 		const doomJsCode = readFileSync(doomJsPath, "utf-8");
+		this.debug(`init:js-bytes=${doomJsCode.length}`);
 		const moduleExports: { exports: unknown } = { exports: {} };
 		const nativeRequire = createRequire(doomJsPath);
 		const wasmDebug: string[] = [];
@@ -113,9 +131,11 @@ export class DoomEngine {
 			}
 		};
 		const moduleFunc = new Function("module", "exports", "__dirname", "__filename", "require", doomJsCode);
+		this.debug("init:module-func-created");
 		moduleFunc(moduleExports, moduleExports.exports, buildDir, doomJsPath, nativeRequire);
+		this.debug("init:module-func-ran");
 		const createDoomModule = moduleExports.exports as (config: unknown) => Promise<DoomModule>;
-		this.progress?.("DOOM init: JS glue loaded, instantiating module...");
+		await this.yieldAfterProgress("DOOM init: JS glue loaded, instantiating module...");
 
 		const moduleConfig = {
 			locateFile: (path: string) => {
@@ -137,9 +157,11 @@ export class DoomEngine {
 
 		try {
 			const initStart = Date.now();
-			this.progress?.("DOOM init: calling createDoomModule...");
+			await this.yieldAfterProgress("DOOM init: calling createDoomModule...");
+			this.debug("init:before-createDoomModule");
 			const modulePromise = createDoomModule(moduleConfig);
-			this.progress?.("DOOM init: createDoomModule returned.");
+			this.debug("init:after-createDoomModule-call");
+			await this.yieldAfterProgress("DOOM init: createDoomModule returned.");
 			const moduleOrTimeout = await Promise.race([
 				modulePromise,
 				new Promise<never>((_, reject) => {
@@ -153,31 +175,37 @@ export class DoomEngine {
 				}),
 			]);
 			this.module = moduleOrTimeout;
+			this.debug("init:module-ready");
 			if (!this.module) {
 				throw new Error("Failed to initialize DOOM module");
 			}
-			this.progress?.("DOOM init: module instantiated.");
+			await this.yieldAfterProgress("DOOM init: module instantiated.");
 		} finally {
+			this.debug("init:restore-webassembly-globals");
 			(WebAssembly as unknown as { compile: typeof WebAssembly.compile }).compile = originalCompile;
 			(WebAssembly as unknown as { instantiate: typeof WebAssembly.instantiate }).instantiate =
 				originalInstantiate;
 		}
 
 		// Initialize DOOM
-		this.progress?.("DOOM init: booting engine...");
+		await this.yieldAfterProgress("DOOM init: booting engine...");
+		this.debug("init:before-initDoom");
 		this.initDoom();
-		this.progress?.("DOOM init: engine booted.");
+		await this.yieldAfterProgress("DOOM init: engine booted.");
+		this.debug("init:after-initDoom");
 
 		// Get framebuffer info
 		this.frameBufferPtr = this.module._DG_GetFrameBuffer();
 		this._width = this.module._DG_GetScreenWidth();
 		this._height = this.module._DG_GetScreenHeight();
 		this.initialized = true;
-		this.progress?.(`DOOM init: framebuffer ready (${this._width}x${this._height}).`);
+		await this.yieldAfterProgress(`DOOM init: framebuffer ready (${this._width}x${this._height}).`);
+		this.debug(`init:framebuffer=${this._width}x${this._height}`);
 	}
 
 	private initDoom(): void {
 		if (!this.module) return;
+		this.debug("initDoom:start");
 
 		const args = ["doom", "-iwad", "/doom/doom1.wad"];
 		const argPtrs: number[] = [];
@@ -197,11 +225,13 @@ export class DoomEngine {
 		}
 
 		this.module._doomgeneric_Create(args.length, argvPtr);
+		this.debug("initDoom:after-create");
 
 		for (const ptr of argPtrs) {
 			this.module._free(ptr);
 		}
 		this.module._free(argvPtr);
+		this.debug("initDoom:done");
 	}
 
 	/**
