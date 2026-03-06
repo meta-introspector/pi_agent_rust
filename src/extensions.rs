@@ -18994,6 +18994,10 @@ fn is_likely_flat_extension_entry(path: &Path) -> bool {
     .iter()
     .any(|needle| preview.contains(needle));
 
+    let has_named_initializer = named_flat_extension_initializer_regex().is_match(&preview);
+    let has_default_object_initializer =
+        default_object_flat_extension_initializer_regex().is_match(&preview);
+
     let has_registration = [
         "registerCommand(",
         "registerTool(",
@@ -19009,7 +19013,30 @@ fn is_likely_flat_extension_entry(path: &Path) -> bool {
     .iter()
     .any(|needle| preview.contains(needle));
 
-    has_default_initializer || has_registration
+    has_default_initializer
+        || has_named_initializer
+        || has_default_object_initializer
+        || has_registration
+}
+
+fn named_flat_extension_initializer_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?m)\bexport\s+(?:async\s+)?function\s+(?:activate|init(?:ialize)?|setup|register|plugin|main)\b|\bexport\s+(?:const|let|var)\s+(?:activate|init(?:ialize)?|setup|register|plugin|main)\b",
+        )
+        .expect("named flat extension initializer regex")
+    })
+}
+
+fn default_object_flat_extension_initializer_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?ms)\bexport\s+default\s*\{.*?\b(?:activate|init(?:ialize)?|setup|register|plugin|main)\s*(?:[:(])",
+        )
+        .expect("default object flat extension initializer regex")
+    })
 }
 
 fn discover_auxiliary_example_entries(
@@ -28921,6 +28948,41 @@ mod tests {
         assert_eq!(discovered.len(), 2);
         assert!(discovered.contains(&safe_canonicalize(&a)));
         assert!(discovered.contains(&safe_canonicalize(&b)));
+    }
+
+    #[test]
+    fn discover_related_extension_entries_includes_named_initializer_siblings() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("named-init");
+        std::fs::create_dir_all(&root).expect("mkdir named-init");
+
+        let alpha = root.join("alpha.ts");
+        let beta = root.join("beta.ts");
+        std::fs::write(&alpha, "export async function activate(_pi) {}\n").expect("write alpha");
+        std::fs::write(&beta, "export function initialize(_pi) {}\n").expect("write beta");
+
+        let discovered = discover_related_extension_entries(&alpha);
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered.contains(&safe_canonicalize(&alpha)));
+        assert!(discovered.contains(&safe_canonicalize(&beta)));
+    }
+
+    #[test]
+    fn discover_related_extension_entries_includes_default_object_initializer_siblings() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("default-object");
+        std::fs::create_dir_all(&root).expect("mkdir default-object");
+
+        let alpha = root.join("alpha.ts");
+        let beta = root.join("beta.ts");
+        std::fs::write(&alpha, "export default { activate(_pi) {} };\n").expect("write alpha");
+        std::fs::write(&beta, "export default { initialize: async (_pi) => {} };\n")
+            .expect("write beta");
+
+        let discovered = discover_related_extension_entries(&alpha);
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered.contains(&safe_canonicalize(&alpha)));
+        assert!(discovered.contains(&safe_canonicalize(&beta)));
     }
 
     #[test]

@@ -85,7 +85,7 @@ fn startup_init_cmd_sequences_window_size_before_pending() {
         .execute()
         .expect("startup init message");
     let sequence = msg
-        .downcast::<bubbletea::SequenceMsg>()
+        .downcast::<bubbletea::message::SequenceMsg>()
         .expect("startup sequence message");
 
     let mut cmds = sequence.0.into_iter();

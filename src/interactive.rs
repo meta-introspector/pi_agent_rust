@@ -687,7 +687,7 @@ impl PiApp {
     }
 
     fn maybe_trigger_autocomplete(&mut self) {
-        if self.agent_state != AgentState::Idle
+        if !matches!(self.agent_state, AgentState::Idle)
             || self.session_picker.is_some()
             || self.settings_ui.is_some()
         {
@@ -734,7 +734,7 @@ impl PiApp {
     /// acts as progress feedback; suppressing the extra animated status row
     /// reduces redraw churn and visible flicker.
     fn show_processing_status_spinner(&self) -> bool {
-        if self.agent_state == AgentState::Idle || self.current_tool.is_some() {
+        if matches!(self.agent_state, AgentState::Idle) || self.current_tool.is_some() {
             return false;
         }
 
@@ -748,7 +748,7 @@ impl PiApp {
     /// The spinner is rendered either for tool execution progress, or for the
     /// generic processing state before visible stream output appears.
     fn spinner_visible(&self) -> bool {
-        if self.agent_state == AgentState::Idle {
+        if matches!(self.agent_state, AgentState::Idle) {
             return false;
         }
         self.current_tool.is_some() || self.show_processing_status_spinner()
@@ -759,7 +759,7 @@ impl PiApp {
     /// Keeping this in one place prevents overlay/input drift between
     /// rendering, viewport sizing, and keyboard dispatch.
     fn editor_input_is_available(&self) -> bool {
-        self.agent_state == AgentState::Idle
+        matches!(self.agent_state, AgentState::Idle)
             && self.tree_ui.is_none()
             && self.session_picker.is_none()
             && self.settings_ui.is_none()
@@ -1822,10 +1822,10 @@ impl PiApp {
         } else {
             None
         };
-        let was_busy = self.agent_state != AgentState::Idle;
+        let was_busy = !matches!(self.agent_state, AgentState::Idle);
         let was_spinner_visible = self.spinner_visible();
         let result = self.update_inner(msg);
-        let became_busy = !was_busy && self.agent_state != AgentState::Idle;
+        let became_busy = !was_busy && !matches!(self.agent_state, AgentState::Idle);
         let spinner_became_visible = !was_spinner_visible && self.spinner_visible();
         let result = if became_busy || spinner_became_visible {
             batch(vec![result, self.spinner_init_cmd()])
@@ -2184,7 +2184,7 @@ impl PiApp {
                 }
 
                 // Extension shortcuts: check if unhandled key matches an extension shortcut
-                if self.agent_state == AgentState::Idle {
+                if matches!(self.agent_state, AgentState::Idle) {
                     let key_id = binding.to_string().to_lowercase();
                     if let Some(manager) = &self.extensions {
                         if manager.has_shortcut(&key_id) {
@@ -2199,7 +2199,7 @@ impl PiApp {
         }
 
         // Forward to appropriate component based on state
-        if self.agent_state == AgentState::Idle {
+        if matches!(self.agent_state, AgentState::Idle) {
             let old_height = self.input.height();
 
             if let Some(key) = msg.downcast_ref::<KeyMsg>() {
