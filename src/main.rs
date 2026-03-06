@@ -491,37 +491,25 @@ fn policy_config_example(profile: &str, allow_dangerous: bool) -> serde_json::Va
     })
 }
 
-fn policy_default_toggle_example(default_permissive: bool) -> serde_json::Value {
-    serde_json::json!({
-        "extensionPolicy": {
-            "defaultPermissive": default_permissive,
-        }
-    })
-}
-
 fn extension_policy_migration_guardrails(
     resolved: &pi::config::ResolvedExtensionPolicy,
 ) -> serde_json::Value {
     serde_json::json!({
-        "default_profile": "permissive",
-        "active_default_profile": resolved.profile_source == "default" && resolved.effective_profile == "permissive",
+        "default_profile": "safe",
+        "active_default_profile": resolved.profile_source == "default" && resolved.effective_profile == "safe",
         "profile_source": resolved.profile_source,
-        "permissive_by_default_reason": "Fresh installs favor extension compatibility and custom UI out of the box.",
-        "override_cli": {
+        "opt_in_cli": {
             "safe_strict_mode": "pi --extension-policy safe <your command>",
             "balanced_prompt_mode": "pi --extension-policy balanced <your command>",
             "balanced_with_dangerous_caps": "PI_EXTENSION_ALLOW_DANGEROUS=1 pi --extension-policy balanced <your command>",
             "explicit_permissive": "pi --extension-policy permissive <your command>",
         },
         "settings_examples": {
-            "default_permissive": policy_default_toggle_example(true),
-            "default_safe": policy_default_toggle_example(false),
             "safe_strict_mode": policy_config_example("safe", false),
             "balanced_prompt_mode": policy_config_example("balanced", false),
             "balanced_with_dangerous_caps": policy_config_example("balanced", true),
             "explicit_permissive": policy_config_example("permissive", false),
         },
-        "revert_to_safe_cli": "pi --extension-policy safe <your command>",
     })
 }
 
