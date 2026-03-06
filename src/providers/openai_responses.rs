@@ -327,9 +327,8 @@ impl Provider for OpenAIResponsesProvider {
                         return Some((Ok(event), state));
                     }
 
-                    // We may have marked the stream finished (e.g. after receiving
-                    // response.completed) but still need to drain queued events (ToolCallEnd,
-                    // Done, etc). Only stop once the queue is empty.
+                    // We may have queued terminal events (ToolCallEnd, Done, etc) after
+                    // consuming the final wire chunk. Only stop once the queue is empty.
                     if state.finished {
                         return None;
                     }
@@ -339,9 +338,13 @@ impl Provider for OpenAIResponsesProvider {
                             // A successful chunk resets the consecutive error counter.
                             state.write_zero_count = 0;
                             if msg.data == "[DONE]" {
-                                // Best-effort fallback: if we didn't see a completed/incomplete
-                                // chunk, emit Done using current state.
-                                state.finish(None);
+                                // Response terminal metadata can arrive before trailing item
+                                // events, so only emit Done once the wire stream itself ends.
+                                if !state.finish_terminal_response() {
+                                    // Best-effort fallback: if we didn't see a completed or
+                                    // incomplete chunk, emit Done using current state.
+                                    state.finish(None);
+                                }
                                 continue;
                             }
 
@@ -373,6 +376,10 @@ impl Provider for OpenAIResponsesProvider {
                             return Some((Err(err), state));
                         }
                         None => {
+                            if state.finish_terminal_response() {
+                                continue;
+                            }
+
                             // If the stream ends unexpectedly, surface an error. This matches the
                             // agent loop expectation that providers emit Done/Error explicitly.
                             return Some((
@@ -425,6 +432,8 @@ where
     reasoning_blocks: HashMap<ReasoningKey, usize>,
     tool_calls_by_item_id: HashMap<String, ToolCallState>,
     orphan_tool_call_arguments: HashMap<String, String>,
+    terminal_response_seen: bool,
+    terminal_incomplete_reason: Option<String>,
     /// Consecutive WriteZero errors seen without a successful event in between.
     write_zero_count: usize,
 }
@@ -453,6 +462,8 @@ where
             reasoning_blocks: HashMap::new(),
             tool_calls_by_item_id: HashMap::new(),
             orphan_tool_call_arguments: HashMap::new(),
+            terminal_response_seen: false,
+            terminal_incomplete_reason: None,
             write_zero_count: 0,
         }
     }
@@ -464,6 +475,22 @@ where
                 partial: self.partial.clone(),
             });
         }
+    }
+
+    fn record_terminal_response(&mut self, incomplete_reason: Option<String>) {
+        self.terminal_response_seen = true;
+        self.terminal_incomplete_reason = incomplete_reason;
+    }
+
+    fn finish_terminal_response(&mut self) -> bool {
+        if !self.terminal_response_seen {
+            return false;
+        }
+
+        let incomplete_reason = self.terminal_incomplete_reason.take();
+        self.terminal_response_seen = false;
+        self.finish(incomplete_reason);
+        true
     }
 
     fn text_block_for(&mut self, item_id: String, content_index: u32) -> usize {
@@ -625,8 +652,7 @@ where
                     .usage
                     .total_tokens
                     .unwrap_or(response.usage.input_tokens + response.usage.output_tokens);
-
-                self.finish(response.incomplete_reason());
+                self.record_terminal_response(response.incomplete_reason());
             }
             OpenAIResponsesChunk::ResponseFailed { response } => {
                 self.ensure_started();
@@ -1481,6 +1507,53 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_reads_late_tool_call_events_after_response_completed() {
+        let body = [
+            r#"data: {"type":"response.function_call_arguments.delta","item_id":"fc_5","delta":"{\"text\":\"late tool\"}"}"#,
+            "",
+            r#"data: {"type":"response.completed","response":{"incomplete_details":null,"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#,
+            "",
+            r#"data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_5","call_id":"call_5","name":"echo","arguments":"","status":"completed"}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+
+        let out = collect_stream_events_from_body(&body);
+        let start_idx = out
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
+            .expect("tool call start");
+        let delta_idx = out
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ToolCallDelta { delta, .. } if delta == "{\"text\":\"late tool\"}"))
+            .expect("tool call delta");
+        let end_idx = out
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+            .expect("tool call end");
+        let done_idx = out
+            .iter()
+            .position(|event| matches!(event, StreamEvent::Done { .. }))
+            .expect("done event");
+
+        assert!(start_idx < delta_idx);
+        assert!(delta_idx < end_idx);
+        assert!(end_idx < done_idx);
+
+        let tool_end = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .expect("tool call end");
+        assert_eq!(tool_end.id, "call_5");
+        assert_eq!(tool_end.arguments, json!({ "text": "late tool" }));
+    }
+
+    #[test]
     fn test_stream_sets_bearer_auth_header() {
         let captured = run_stream_and_capture_headers().expect("captured request");
         assert_eq!(
@@ -1599,15 +1672,71 @@ mod tests {
             );
 
             let mut out = Vec::new();
-            while let Some(item) = state.event_source.next().await {
-                let msg = item.expect("SSE event");
-                state.process_event(&msg.data).expect("process_event");
-                out.extend(state.pending_events.drain(..));
+            loop {
+                if let Some(event) = state.pending_events.pop_front() {
+                    out.push(event);
+                    continue;
+                }
+
                 if state.finished {
                     break;
                 }
+
+                match state.event_source.next().await {
+                    Some(item) => {
+                        let msg = item.expect("SSE event");
+                        if msg.data == "[DONE]" {
+                            if !state.finish_terminal_response() {
+                                state.finish(None);
+                            }
+                            continue;
+                        }
+                        state.process_event(&msg.data).expect("process_event");
+                    }
+                    None => {
+                        assert!(
+                            state.finish_terminal_response(),
+                            "stream ended without Done event"
+                        );
+                    }
+                }
             }
 
+            out
+        })
+    }
+
+    fn collect_stream_events_from_body(body: &str) -> Vec<StreamEvent> {
+        let (base_url, _rx) = spawn_test_server(200, "text/event-stream", body);
+        let provider = OpenAIResponsesProvider::new("gpt-4o").with_base_url(base_url);
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        let options = StreamOptions {
+            api_key: Some("test-openai-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            let mut out = Vec::new();
+            while let Some(event) = stream.next().await {
+                let event = event.expect("stream event");
+                let is_terminal =
+                    matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
+                out.push(event);
+                if is_terminal {
+                    break;
+                }
+            }
             out
         })
     }
@@ -1693,7 +1822,7 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!(),
+                    Err(err) => assert!(false, "request header read failed: {err}"),
                 }
             }
 
@@ -1719,7 +1848,7 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!(),
+                    Err(err) => assert!(false, "request body read failed: {err}"),
                 }
             }
 

@@ -146,9 +146,7 @@ use self::tree::{
 /// small terminals while allowing taller lists on large ones.
 fn overlay_max_visible(term_height: usize) -> usize {
     const OVERLAY_CHROME_ROWS: usize = 8;
-    term_height
-        .saturating_sub(OVERLAY_CHROME_ROWS)
-        .clamp(3, 30)
+    term_height.saturating_sub(OVERLAY_CHROME_ROWS).clamp(3, 30)
 }
 
 // ============================================================================

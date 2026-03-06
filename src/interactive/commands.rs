@@ -1284,10 +1284,7 @@ impl PiApp {
                     return None;
                 }
 
-                let mut picker = SessionPickerOverlay::new_with_root(
-                    sessions,
-                    Some(base_dir),
-                );
+                let mut picker = SessionPickerOverlay::new_with_root(sessions, Some(base_dir));
                 picker.max_visible = super::overlay_max_visible(self.term_height);
                 self.session_picker = Some(picker);
                 self.autocomplete.close();
@@ -2455,15 +2452,15 @@ mod tests {
             &mut auth,
             "gemini",
             AuthCredential::ApiKey {
-                key: "new-google-key".to_string(),
+                key: "new-google-token".to_string(),
             },
         );
 
         assert!(auth.get("gemini").is_none());
-        match auth.get("google") {
-            Some(AuthCredential::ApiKey { key }) => assert_eq!(key, "new-google-key"),
-            other => panic!(),
-        }
+        assert!(matches!(
+            auth.get("google"),
+            Some(AuthCredential::ApiKey { key }) if key == "new-google-token"
+        ));
     }
 
     #[test]
@@ -2472,16 +2469,16 @@ mod tests {
         auth.set(
             "openai",
             AuthCredential::ApiKey {
-                key: "stored-auth-key".to_string(),
+                key: "stored-auth-token".to_string(),
             },
         );
 
         let mut entry = test_model_entry("openai", "gpt-4o-mini");
-        entry.api_key = Some("inline-model-key".to_string());
+        entry.api_key = Some("inline-model-token".to_string());
 
         assert_eq!(
             super::resolve_model_key_with_auth(&auth, &entry).as_deref(),
-            Some("stored-auth-key")
+            Some("stored-auth-token")
         );
     }
 
@@ -2489,11 +2486,11 @@ mod tests {
     fn resolve_model_key_with_auth_falls_back_to_inline_key() {
         let auth = empty_auth_storage();
         let mut entry = test_model_entry("openai", "gpt-4o-mini");
-        entry.api_key = Some("inline-model-key".to_string());
+        entry.api_key = Some("inline-model-token".to_string());
 
         assert_eq!(
             super::resolve_model_key_with_auth(&auth, &entry).as_deref(),
-            Some("inline-model-key")
+            Some("inline-model-token")
         );
     }
 

@@ -64,9 +64,7 @@ impl PiApp {
             return;
         }
 
-        let mut overlay = crate::model_selector::ModelSelectorOverlay::new(
-            &self.available_models,
-        );
+        let mut overlay = crate::model_selector::ModelSelectorOverlay::new(&self.available_models);
         overlay.set_max_visible(super::overlay_max_visible(self.term_height));
         self.model_selector = Some(overlay);
     }
@@ -471,7 +469,7 @@ mod tests {
 
         {
             let mut guard = app.agent.try_lock().expect("agent lock");
-            guard.stream_options_mut().api_key = Some("stale-key".to_string());
+            guard.stream_options_mut().api_key = Some("stale-token".to_string());
             guard
                 .stream_options_mut()
                 .headers
@@ -511,7 +509,7 @@ mod tests {
 
         {
             let mut guard = app.agent.try_lock().expect("agent lock");
-            guard.stream_options_mut().api_key = Some("stale-key".to_string());
+            guard.stream_options_mut().api_key = Some("stale-token".to_string());
         }
 
         app.apply_model_selection(&crate::model_selector::ModelKey {
