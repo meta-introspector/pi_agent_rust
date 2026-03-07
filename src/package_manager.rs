@@ -2928,7 +2928,10 @@ fn normalize_remote_git_repo(repo_raw: &str) -> (String, String, String) {
                         .trim()
                         .trim_matches('/')
                         .trim_end_matches(".git")
-                        .to_string();
+                        .split('/')
+                        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+                        .collect::<Vec<_>>()
+                        .join("/");
                     let repo = if path.is_empty() {
                         host.clone()
                     } else {
@@ -3764,7 +3767,7 @@ mod tests {
             let _: Result<()> = finish_package_task(handle, Err(()), "Install task cancelled");
         }));
 
-        println!("resolved: {:#?}", resolved.extensions); assert!(
+        assert!(
             panic.is_err(),
             "worker panic should not be masked as cancellation"
         );
@@ -3777,7 +3780,7 @@ mod tests {
         let err = finish_package_task::<(), _>(handle, Err(()), "Install task cancelled")
             .expect_err("error");
 
-        println!("resolved: {:#?}", resolved.extensions); assert!(
+        assert!(
             err.to_string().contains("Install task cancelled"),
             "unexpected error: {err}"
         );
@@ -3812,21 +3815,21 @@ mod tests {
 
     #[test]
     fn test_sources_match_normalization() {
-        println!("resolved: {:#?}", resolved.extensions); assert!(sources_match("npm:foo@1", "npm:foo@2"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(sources_match(
+        assert!(sources_match("npm:foo@1", "npm:foo@2"));
+        assert!(sources_match(
             "git:github.com/a/b@v1",
             "git:github.com/a/b@v2"
         ));
-        println!("resolved: {:#?}", resolved.extensions); assert!(sources_match(
+        assert!(sources_match(
             "https://github.com/a/b.git@v1",
             "github.com/a/b"
         ));
-        println!("resolved: {:#?}", resolved.extensions); assert!(sources_match(
+        assert!(sources_match(
             "git:https://token-a@github.com/a/b.git@v1",
             "git:https://token-b@github.com/a/b.git@v2"
         ));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!sources_match("npm:foo", "npm:bar"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!sources_match("git:github.com/a/b", "git:github.com/a/c"));
+        assert!(!sources_match("npm:foo", "npm:bar"));
+        assert!(!sources_match("git:github.com/a/b", "git:github.com/a/c"));
     }
 
     #[test]
@@ -3850,7 +3853,7 @@ mod tests {
 
         let identity = manager.package_identity("./foo/../bar");
         let expected_suffix = format!("{}/bar", dir.path().display());
-        println!("resolved: {:#?}", resolved.extensions); assert!(identity.ends_with(&expected_suffix), "{identity}");
+        assert!(identity.ends_with(&expected_suffix), "{identity}");
     }
 
     #[test]
@@ -3956,12 +3959,12 @@ mod tests {
             .remove_sync("git:github.com", PackageScope::Project)
             .expect_err("host-only git source should be rejected");
 
-        println!("resolved: {:#?}", resolved.extensions); assert!(
+        assert!(
             err.to_string().contains("Invalid git package source"),
             "unexpected error: {err}"
         );
-        println!("resolved: {:#?}", resolved.extensions); assert!(host_bucket.exists(), "host bucket should be preserved");
-        println!("resolved: {:#?}", resolved.extensions); assert!(repo_dir.exists(), "nested repo should be preserved");
+        assert!(host_bucket.exists(), "host bucket should be preserved");
+        assert!(repo_dir.exists(), "nested repo should be preserved");
     }
 
     #[test]
@@ -4033,8 +4036,8 @@ mod tests {
                 .iter()
                 .find(|entry| entry.path == package_root.join("extensions/a.native.json"))
                 .expect("a.native.json entry");
-            println!("resolved: {:#?}", resolved.extensions); assert!(!disabled.enabled);
-            println!("resolved: {:#?}", resolved.extensions); assert!(
+            assert!(!disabled.enabled);
+            assert!(
                 resolved
                     .extensions
                     .iter()
@@ -4077,7 +4080,7 @@ mod tests {
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].source, "npm:override-only");
         assert_eq!(packages[0].scope, PackageScope::User);
-        println!("resolved: {:#?}", resolved.extensions); assert!(
+        assert!(
             !roots.project_settings_enabled,
             "full config override should disable project settings"
         );
@@ -4096,7 +4099,10 @@ mod tests {
             fs::create_dir_all(package_root.join("extensions")).expect("create extensions dir");
             fs::write(package_root.join("extensions/a.native.json"), "{}")
                 .expect("write a.native.json");
-            fs::write(package_root.join("extensions/b.native.json"), "{}")
+                
+            let package_root2 = temp_dir.path().join("pkg2");
+            fs::create_dir_all(package_root2.join("extensions")).expect("create extensions dir");
+            fs::write(package_root2.join("extensions/b.native.json"), "{}")
                 .expect("write b.native.json");
             let project_local_extension =
                 project_root.join(".pi/extensions/project-local.native.json");
@@ -4124,7 +4130,7 @@ mod tests {
             let project_settings = json!({
                 "extensions": ["extensions/project-local.native.json"],
                 "packages": [{
-                    "source": package_root.to_string_lossy(),
+                    "source": package_root2.to_string_lossy(),
                     "extensions": ["extensions/b.native.json"]
                 }]
             });
@@ -4158,21 +4164,21 @@ mod tests {
                 package_root.join("extensions/a.native.json")
             );
             assert_eq!(enabled_extensions[0].metadata.scope, PackageScope::User);
-            println!("resolved: {:#?}", resolved.extensions); assert!(
+            assert!(
                 resolved
                     .extensions
                     .iter()
-                    .all(|entry| entry.path != package_root.join("extensions/b.native.json")),
+                    .all(|entry| entry.path != package_root2.join("extensions/b.native.json")),
                 "project package resources should be ignored when a full config override is active"
             );
-            println!("resolved: {:#?}", resolved.extensions); assert!(
+            assert!(
                 resolved
                     .extensions
                     .iter()
                     .all(|entry| entry.path != project_local_extension),
                 "project local settings entries should be ignored when a full config override is active"
             );
-            println!("resolved: {:#?}", resolved.extensions); assert!(
+            assert!(
                 resolved
                     .extensions
                     .iter()
@@ -4204,7 +4210,7 @@ mod tests {
 
             assert_eq!(resolved.extensions.len(), 1);
             let entry = &resolved.extensions[0];
-            println!("resolved: {:#?}", resolved.extensions); assert!(entry.enabled);
+            assert!(entry.enabled);
             assert_eq!(entry.path, extension_path);
             assert_eq!(entry.metadata.scope, PackageScope::Temporary);
             assert_eq!(entry.metadata.origin, ResourceOrigin::Package);
@@ -4230,7 +4236,7 @@ mod tests {
                 .await
                 .expect_err("missing CLI extension path should fail");
 
-            println!("resolved: {:#?}", resolved.extensions); assert!(
+            assert!(
                 err.to_string().contains("does not exist"),
                 "unexpected error: {err}"
             );
@@ -4256,7 +4262,7 @@ mod tests {
                 .await
                 .expect_err("unsupported CLI extension file should fail");
 
-            println!("resolved: {:#?}", resolved.extensions); assert!(
+            assert!(
                 err.to_string()
                     .contains("Unsupported extension source file"),
                 "unexpected error: {err}"
@@ -4343,8 +4349,8 @@ mod tests {
                 .iter()
                 .map(|entry| entry.path.clone())
                 .collect::<Vec<_>>();
-            println!("resolved: {:#?}", resolved.extensions); assert!(paths.contains(&package_root.join("extensions/a.native.json")));
-            println!("resolved: {:#?}", resolved.extensions); assert!(!paths.contains(&package_root.join("extensions/b.native.json")));
+            assert!(paths.contains(&package_root.join("extensions/a.native.json")));
+            assert!(!paths.contains(&package_root.join("extensions/b.native.json")));
         });
     }
 
@@ -4380,14 +4386,14 @@ mod tests {
 
     #[test]
     fn is_pattern_detects_all_prefix_operators() {
-        println!("resolved: {:#?}", resolved.extensions); assert!(is_pattern("!exclude_me"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(is_pattern("+force_include"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(is_pattern("-force_exclude"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(is_pattern("*.js"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(is_pattern("foo?bar"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!is_pattern("plain_entry"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!is_pattern("extensions/a.js"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!is_pattern(""));
+        assert!(is_pattern("!exclude_me"));
+        assert!(is_pattern("+force_include"));
+        assert!(is_pattern("-force_exclude"));
+        assert!(is_pattern("*.js"));
+        assert!(is_pattern("foo?bar"));
+        assert!(!is_pattern("plain_entry"));
+        assert!(!is_pattern("extensions/a.js"));
+        assert!(!is_pattern(""));
     }
 
     #[test]
@@ -4408,8 +4414,8 @@ mod tests {
     #[test]
     fn split_patterns_empty_input() {
         let (plain, patterns) = split_patterns(&[]);
-        println!("resolved: {:#?}", resolved.extensions); assert!(plain.is_empty());
-        println!("resolved: {:#?}", resolved.extensions); assert!(patterns.is_empty());
+        assert!(plain.is_empty());
+        assert!(patterns.is_empty());
     }
 
     // ======================================================================
@@ -4461,21 +4467,21 @@ mod tests {
 
     #[test]
     fn pattern_matches_simple_glob() {
-        println!("resolved: {:#?}", resolved.extensions); assert!(pattern_matches("*.js", "foo.js"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(pattern_matches("*.js", "bar.js"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!pattern_matches("*.js", "foo.ts"));
+        assert!(pattern_matches("*.js", "foo.js"));
+        assert!(pattern_matches("*.js", "bar.js"));
+        assert!(!pattern_matches("*.js", "foo.ts"));
     }
 
     #[test]
     fn pattern_matches_exact() {
-        println!("resolved: {:#?}", resolved.extensions); assert!(pattern_matches("foo.js", "foo.js"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!pattern_matches("foo.js", "bar.js"));
+        assert!(pattern_matches("foo.js", "foo.js"));
+        assert!(!pattern_matches("foo.js", "bar.js"));
     }
 
     #[test]
     fn pattern_matches_question_mark() {
-        println!("resolved: {:#?}", resolved.extensions); assert!(pattern_matches("?.js", "a.js"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!pattern_matches("?.js", "ab.js"));
+        assert!(pattern_matches("?.js", "a.js"));
+        assert!(!pattern_matches("?.js", "ab.js"));
     }
 
     // ======================================================================
@@ -4484,27 +4490,27 @@ mod tests {
 
     #[test]
     fn looks_like_git_url_recognizes_known_hosts() {
-        println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_git_url("github.com/user/repo"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_git_url("https://github.com/user/repo"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_git_url("gitlab.com/user/repo"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_git_url("bitbucket.org/user/repo"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_git_url("codeberg.org/user/repo"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!looks_like_git_url("example.com/user/repo"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!looks_like_git_url("npm:foo"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!looks_like_git_url("./local"));
+        assert!(looks_like_git_url("github.com/user/repo"));
+        assert!(looks_like_git_url("https://github.com/user/repo"));
+        assert!(looks_like_git_url("gitlab.com/user/repo"));
+        assert!(looks_like_git_url("bitbucket.org/user/repo"));
+        assert!(looks_like_git_url("codeberg.org/user/repo"));
+        assert!(!looks_like_git_url("example.com/user/repo"));
+        assert!(!looks_like_git_url("npm:foo"));
+        assert!(!looks_like_git_url("./local"));
     }
 
     #[test]
     fn looks_like_local_path_various_forms() {
-        println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_local_path("."));
-        println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_local_path(".."));
-        println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_local_path("./relative"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_local_path("../parent"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_local_path("/absolute"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_local_path("~/home_relative"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_local_path("file:///abs/path"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!looks_like_local_path("npm:foo"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!looks_like_local_path("github.com/user/repo"));
+        assert!(looks_like_local_path("."));
+        assert!(looks_like_local_path(".."));
+        assert!(looks_like_local_path("./relative"));
+        assert!(looks_like_local_path("../parent"));
+        assert!(looks_like_local_path("/absolute"));
+        assert!(looks_like_local_path("~/home_relative"));
+        assert!(looks_like_local_path("file:///abs/path"));
+        assert!(!looks_like_local_path("npm:foo"));
+        assert!(!looks_like_local_path("github.com/user/repo"));
     }
 
     // ======================================================================
@@ -4603,7 +4609,7 @@ mod tests {
     #[test]
     fn extract_string_array_from_null() {
         let result = extract_string_array(None);
-        println!("resolved: {:#?}", resolved.extensions); assert!(result.is_empty());
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -4620,10 +4626,10 @@ mod tests {
     #[test]
     fn extract_package_spec_from_string() {
         let spec = extract_package_spec(&json!("npm:foo@1.0"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(spec.is_some());
+        assert!(spec.is_some());
         let spec = spec.unwrap();
         assert_eq!(spec.source, "npm:foo@1.0");
-        println!("resolved: {:#?}", resolved.extensions); assert!(spec.filter.is_none());
+        assert!(spec.filter.is_none());
     }
 
     #[test]
@@ -4634,7 +4640,7 @@ mod tests {
             "skills": "my-skill"
         });
         let spec = extract_package_spec(&val);
-        println!("resolved: {:#?}", resolved.extensions); assert!(spec.is_some());
+        assert!(spec.is_some());
         let spec = spec.unwrap();
         assert_eq!(spec.source, "npm:bar");
         let filter = spec.filter.unwrap();
@@ -4643,27 +4649,27 @@ mod tests {
             Some(vec!["a.js".to_string(), "b.js".to_string()])
         );
         assert_eq!(filter.skills, Some(vec!["my-skill".to_string()]));
-        println!("resolved: {:#?}", resolved.extensions); assert!(filter.prompts.is_none());
-        println!("resolved: {:#?}", resolved.extensions); assert!(filter.themes.is_none());
+        assert!(filter.prompts.is_none());
+        assert!(filter.themes.is_none());
     }
 
     #[test]
     fn extract_package_spec_from_object_missing_source() {
         let val = json!({"extensions": ["a.js"]});
-        println!("resolved: {:#?}", resolved.extensions); assert!(extract_package_spec(&val).is_none());
+        assert!(extract_package_spec(&val).is_none());
     }
 
     #[test]
     fn extract_package_spec_from_non_string_non_object() {
-        println!("resolved: {:#?}", resolved.extensions); assert!(extract_package_spec(&json!(42)).is_none());
-        println!("resolved: {:#?}", resolved.extensions); assert!(extract_package_spec(&json!(null)).is_none());
-        println!("resolved: {:#?}", resolved.extensions); assert!(extract_package_spec(&json!(true)).is_none());
+        assert!(extract_package_spec(&json!(42)).is_none());
+        assert!(extract_package_spec(&json!(null)).is_none());
+        assert!(extract_package_spec(&json!(true)).is_none());
     }
 
     #[test]
     fn extract_filter_field_absent_key() {
         let obj = serde_json::Map::new();
-        println!("resolved: {:#?}", resolved.extensions); assert!(extract_filter_field(&obj, "extensions").is_none());
+        assert!(extract_filter_field(&obj, "extensions").is_none());
     }
 
     #[test]
@@ -4698,14 +4704,14 @@ mod tests {
     fn is_enabled_by_overrides_no_overrides_enables_all() {
         let path = Path::new("/base/extensions/foo.js");
         let patterns: Vec<String> = vec!["extensions/foo.js".to_string()];
-        println!("resolved: {:#?}", resolved.extensions); assert!(is_enabled_by_overrides(path, &patterns, Path::new("/base")));
+        assert!(is_enabled_by_overrides(path, &patterns, Path::new("/base")));
     }
 
     #[test]
     fn is_enabled_by_overrides_exclude_disables() {
         let path = Path::new("/base/extensions/foo.js");
         let patterns = vec!["!*.js".to_string()];
-        println!("resolved: {:#?}", resolved.extensions); assert!(!is_enabled_by_overrides(
+        assert!(!is_enabled_by_overrides(
             path,
             &patterns,
             Path::new("/base")
@@ -4716,7 +4722,7 @@ mod tests {
     fn is_enabled_by_overrides_force_include_overrides_exclude() {
         let path = Path::new("/base/extensions/foo.js");
         let patterns = vec!["!*.js".to_string(), "+extensions/foo.js".to_string()];
-        println!("resolved: {:#?}", resolved.extensions); assert!(is_enabled_by_overrides(path, &patterns, Path::new("/base")));
+        assert!(is_enabled_by_overrides(path, &patterns, Path::new("/base")));
     }
 
     #[test]
@@ -4726,7 +4732,7 @@ mod tests {
             "+extensions/foo.js".to_string(),
             "-extensions/foo.js".to_string(),
         ];
-        println!("resolved: {:#?}", resolved.extensions); assert!(!is_enabled_by_overrides(
+        assert!(!is_enabled_by_overrides(
             path,
             &patterns,
             Path::new("/base")
@@ -4747,9 +4753,9 @@ mod tests {
         ];
         let patterns = vec!["*.js".to_string()];
         let result = apply_patterns(&paths, &patterns, base);
-        println!("resolved: {:#?}", resolved.extensions); assert!(result.contains(&PathBuf::from("/base/a.js")));
-        println!("resolved: {:#?}", resolved.extensions); assert!(result.contains(&PathBuf::from("/base/c.js")));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!result.contains(&PathBuf::from("/base/b.ts")));
+        assert!(result.contains(&PathBuf::from("/base/a.js")));
+        assert!(result.contains(&PathBuf::from("/base/c.js")));
+        assert!(!result.contains(&PathBuf::from("/base/b.ts")));
     }
 
     #[test]
@@ -4762,9 +4768,9 @@ mod tests {
         ];
         let patterns = vec!["*.js".to_string(), "!b.js".to_string()];
         let result = apply_patterns(&paths, &patterns, base);
-        println!("resolved: {:#?}", resolved.extensions); assert!(result.contains(&PathBuf::from("/base/a.js")));
-        println!("resolved: {:#?}", resolved.extensions); assert!(!result.contains(&PathBuf::from("/base/b.js")));
-        println!("resolved: {:#?}", resolved.extensions); assert!(result.contains(&PathBuf::from("/base/c.js")));
+        assert!(result.contains(&PathBuf::from("/base/a.js")));
+        assert!(!result.contains(&PathBuf::from("/base/b.js")));
+        assert!(result.contains(&PathBuf::from("/base/c.js")));
     }
 
     #[test]
@@ -4781,8 +4787,8 @@ mod tests {
         let paths = vec![PathBuf::from("/base/a.js"), PathBuf::from("/base/b.js")];
         let patterns = vec!["a.js".to_string(), "+b.js".to_string()];
         let result = apply_patterns(&paths, &patterns, base);
-        println!("resolved: {:#?}", resolved.extensions); assert!(result.contains(&PathBuf::from("/base/a.js")));
-        println!("resolved: {:#?}", resolved.extensions); assert!(result.contains(&PathBuf::from("/base/b.js")));
+        assert!(result.contains(&PathBuf::from("/base/a.js")));
+        assert!(result.contains(&PathBuf::from("/base/b.js")));
     }
 
     #[test]
@@ -4791,8 +4797,8 @@ mod tests {
         let paths = vec![PathBuf::from("/base/a.js"), PathBuf::from("/base/b.js")];
         let patterns = vec!["-a.js".to_string()];
         let result = apply_patterns(&paths, &patterns, base);
-        println!("resolved: {:#?}", resolved.extensions); assert!(!result.contains(&PathBuf::from("/base/a.js")));
-        println!("resolved: {:#?}", resolved.extensions); assert!(result.contains(&PathBuf::from("/base/b.js")));
+        assert!(!result.contains(&PathBuf::from("/base/a.js")));
+        assert!(result.contains(&PathBuf::from("/base/b.js")));
     }
 
     // ======================================================================
@@ -4801,8 +4807,8 @@ mod tests {
 
     #[test]
     fn normalize_source_empty_returns_none() {
-        println!("resolved: {:#?}", resolved.extensions); assert!(normalize_source("").is_none());
-        println!("resolved: {:#?}", resolved.extensions); assert!(normalize_source("  ").is_none());
+        assert!(normalize_source("").is_none());
+        assert!(normalize_source("  ").is_none());
     }
 
     #[test]
@@ -4865,7 +4871,7 @@ mod tests {
     fn parse_npm_spec_trailing_at() {
         let (name, version) = parse_npm_spec("foo@");
         assert_eq!(name, "foo@");
-        println!("resolved: {:#?}", resolved.extensions); assert!(version.is_none());
+        assert!(version.is_none());
     }
 
     // ======================================================================
@@ -4940,7 +4946,7 @@ mod tests {
     #[test]
     fn read_settings_json_missing_file_returns_empty_object() {
         let result = read_settings_json(Path::new("/nonexistent/path/settings.json"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(result.is_ok());
+        assert!(result.is_ok());
         assert_eq!(result.unwrap(), json!({}));
     }
 
@@ -4958,7 +4964,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("settings.json");
         fs::write(&path, "not json").expect("write");
-        println!("resolved: {:#?}", resolved.extensions); assert!(read_settings_json(&path).is_err());
+        assert!(read_settings_json(&path).is_err());
     }
 
     #[test]
@@ -4976,11 +4982,11 @@ mod tests {
         assert_eq!(snapshot.packages.len(), 2);
         assert_eq!(snapshot.packages[0].source, "npm:foo");
         assert_eq!(snapshot.packages[1].source, "npm:bar");
-        println!("resolved: {:#?}", resolved.extensions); assert!(snapshot.packages[1].filter.is_some());
+        assert!(snapshot.packages[1].filter.is_some());
         assert_eq!(snapshot.extensions, vec!["ext1.js"]);
         assert_eq!(snapshot.skills, vec!["my-skill"]);
         assert_eq!(snapshot.themes, vec!["dark.json", "light.json"]);
-        println!("resolved: {:#?}", resolved.extensions); assert!(snapshot.prompts.is_empty());
+        assert!(snapshot.prompts.is_empty());
     }
 
     // ======================================================================
@@ -5020,7 +5026,7 @@ mod tests {
         update_package_sources(&path, "npm:foo", UpdateAction::Remove, dir.path()).expect("remove");
         let settings = read_settings_json(&path).expect("read");
         let packages = settings["packages"].as_array().expect("packages array");
-        println!("resolved: {:#?}", resolved.extensions); assert!(packages.is_empty());
+        assert!(packages.is_empty());
     }
 
     #[test]
@@ -5062,14 +5068,14 @@ mod tests {
 
         let err = update_package_sources(&path, "   ", UpdateAction::Add, dir.path())
             .expect_err("must fail");
-        println!("resolved: {:#?}", resolved.extensions); assert!(
+        assert!(
             err.to_string()
                 .contains("settings package source cannot be empty"),
             "unexpected error: {err}"
         );
 
         let settings = read_settings_json(&path).expect("read");
-        println!("resolved: {:#?}", resolved.extensions); assert!(
+        assert!(
             settings.get("packages").is_none(),
             "failed update must not mutate packages"
         );
@@ -5105,7 +5111,7 @@ mod tests {
 
         let settings = read_settings_json(&path).expect("read");
         let packages = settings["packages"].as_array().expect("packages array");
-        println!("resolved: {:#?}", resolved.extensions); assert!(packages.is_empty(), "equivalent local paths should remove");
+        assert!(packages.is_empty(), "equivalent local paths should remove");
     }
 
     // ======================================================================
@@ -5126,9 +5132,9 @@ mod tests {
         let packages = list_packages_in_settings(&path).expect("list");
         assert_eq!(packages.len(), 2);
         assert_eq!(packages[0].source, "npm:foo");
-        println!("resolved: {:#?}", resolved.extensions); assert!(packages[0].filter.is_none());
+        assert!(packages[0].filter.is_none());
         assert_eq!(packages[1].source, "git:github.com/user/repo");
-        println!("resolved: {:#?}", resolved.extensions); assert!(packages[1].filter.is_some());
+        assert!(packages[1].filter.is_some());
     }
 
     // ======================================================================
@@ -5152,15 +5158,15 @@ mod tests {
         )
         .expect("write");
         let result = read_pi_manifest(dir.path());
-        println!("resolved: {:#?}", resolved.extensions); assert!(result.is_some());
+        assert!(result.is_some());
         let result = result.unwrap();
         assert_eq!(
             result.extensions,
             Some(vec!["ext/a.js".to_string(), "ext/b.js".to_string()])
         );
         assert_eq!(result.skills, Some(vec!["skills/foo.md".to_string()]));
-        println!("resolved: {:#?}", resolved.extensions); assert!(result.prompts.is_none());
-        println!("resolved: {:#?}", resolved.extensions); assert!(result.themes.is_none());
+        assert!(result.prompts.is_none());
+        assert!(result.themes.is_none());
     }
 
     #[test]
@@ -5171,13 +5177,13 @@ mod tests {
             r#"{"name": "test", "version": "1.0.0"}"#,
         )
         .expect("write");
-        println!("resolved: {:#?}", resolved.extensions); assert!(read_pi_manifest(dir.path()).is_none());
+        assert!(read_pi_manifest(dir.path()).is_none());
     }
 
     #[test]
     fn read_pi_manifest_no_package_json() {
         let dir = tempfile::tempdir().expect("tempdir");
-        println!("resolved: {:#?}", resolved.extensions); assert!(read_pi_manifest(dir.path()).is_none());
+        assert!(read_pi_manifest(dir.path()).is_none());
     }
 
     // ======================================================================
@@ -5198,8 +5204,8 @@ mod tests {
     fn temporary_dir_includes_prefix() {
         let result = temporary_dir("git-github.com", Some("user/repo"));
         let path_str = result.to_string_lossy();
-        println!("resolved: {:#?}", resolved.extensions); assert!(path_str.contains("pi-extensions"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(path_str.contains("git-github.com"));
+        assert!(path_str.contains("pi-extensions"));
+        assert!(path_str.contains("git-github.com"));
     }
 
     // ======================================================================
@@ -5212,7 +5218,7 @@ mod tests {
         let truthy = ["1", "true", "yes", "on", "TRUE", "Yes", "ON"];
         for val in truthy {
             let lower = val.trim().to_ascii_lowercase();
-            println!("resolved: {:#?}", resolved.extensions); assert!(
+            assert!(
                 matches!(lower.as_str(), "1" | "true" | "yes" | "on"),
                 "{val} should be truthy"
             );
@@ -5220,7 +5226,7 @@ mod tests {
         let falsy = ["0", "false", "no", "off", "", "random"];
         for val in falsy {
             let lower = val.trim().to_ascii_lowercase();
-            println!("resolved: {:#?}", resolved.extensions); assert!(
+            assert!(
                 !matches!(lower.as_str(), "1" | "true" | "yes" | "on"),
                 "{val} should be falsy"
             );
@@ -5238,7 +5244,7 @@ mod tests {
             ParsedSource::Npm { spec, name, pinned } => {
                 assert_eq!(spec, "@scope/pkg@1.0");
                 assert_eq!(name, "@scope/pkg");
-                println!("resolved: {:#?}", resolved.extensions); assert!(pinned);
+                assert!(pinned);
             }
             other => panic!("Unexpected parsed source: {:?}", other),
         }
@@ -5249,7 +5255,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         match parse_source("npm:express", dir.path()) {
             ParsedSource::Npm { pinned, .. } => {
-                println!("resolved: {:#?}", resolved.extensions); assert!(!pinned);
+                assert!(!pinned);
             }
             other => panic!("Unexpected parsed source: {:?}", other),
         }
@@ -5272,7 +5278,7 @@ mod tests {
                 assert_eq!(host, "github.com");
                 assert_eq!(path, "user/repo");
                 assert_eq!(r#ref, Some("v2".to_string()));
-                println!("resolved: {:#?}", resolved.extensions); assert!(pinned);
+                assert!(pinned);
             }
             other => panic!("Unexpected parsed source: {:?}", other),
         }
@@ -5310,7 +5316,7 @@ mod tests {
                 assert_eq!(host, "github.com");
                 assert_eq!(path, "user/repo");
                 assert_eq!(r#ref, Some("main".to_string()));
-                println!("resolved: {:#?}", resolved.extensions); assert!(pinned);
+                assert!(pinned);
             }
             other => panic!("Unexpected parsed source: {:?}", other),
         }
@@ -5471,7 +5477,7 @@ mod tests {
                 .await
                 .expect_err("missing package install should fail");
 
-            println!("resolved: {:#?}", resolved.extensions); assert!(
+            assert!(
                 err.to_string().contains("does not exist"),
                 "unexpected error: {err}"
             );
@@ -5494,13 +5500,13 @@ mod tests {
 
         let entries = collect_auto_prompt_entries(&prompts_dir);
         assert_eq!(entries.len(), 2);
-        println!("resolved: {:#?}", resolved.extensions); assert!(entries.iter().all(|p| p.extension().unwrap() == "md"));
+        assert!(entries.iter().all(|p| p.extension().unwrap() == "md"));
     }
 
     #[test]
     fn collect_auto_prompt_entries_nonexistent_dir() {
         let entries = collect_auto_prompt_entries(Path::new("/nonexistent"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(entries.is_empty());
+        assert!(entries.is_empty());
     }
 
     #[test]
@@ -5514,7 +5520,7 @@ mod tests {
 
         let entries = collect_auto_theme_entries(&themes_dir);
         assert_eq!(entries.len(), 2);
-        println!("resolved: {:#?}", resolved.extensions); assert!(entries.iter().all(|p| p.extension().unwrap() == "json"));
+        assert!(entries.iter().all(|p| p.extension().unwrap() == "json"));
     }
 
     // ======================================================================
@@ -5531,7 +5537,7 @@ mod tests {
         fs::write(ext_dir.join("c.md"), "c").expect("write");
 
         let entries = collect_auto_extension_entries(&ext_dir);
-        println!("resolved: {:#?}", resolved.extensions); assert!(entries.len() >= 2);
+        assert!(entries.len() >= 2);
         let has_a = entries
             .iter()
             .any(|p| p.file_name().unwrap() == "a.native.json");
@@ -5539,9 +5545,9 @@ mod tests {
             .iter()
             .any(|p| p.file_name().unwrap() == "b.native.json");
         let has_md = entries.iter().any(|p| p.file_name().unwrap() == "c.md");
-        println!("resolved: {:#?}", resolved.extensions); assert!(has_a, "should find native descriptor files");
-        println!("resolved: {:#?}", resolved.extensions); assert!(has_b, "should find native descriptor files");
-        println!("resolved: {:#?}", resolved.extensions); assert!(!has_md, "should not find .md files");
+        assert!(has_a, "should find native descriptor files");
+        assert!(has_b, "should find native descriptor files");
+        assert!(!has_md, "should not find .md files");
     }
 
     #[test]
@@ -5552,7 +5558,7 @@ mod tests {
         fs::write(ext_dir.join("my_extension.ts"), "export default {}").expect("write");
 
         let entries = collect_auto_extension_entries(&ext_dir);
-        println!("resolved: {:#?}", resolved.extensions); assert!(
+        assert!(
             entries
                 .iter()
                 .any(|p| p.file_name().unwrap() == "my_extension.ts")
@@ -5644,7 +5650,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ext_dir = dir.path().join("ext");
         fs::create_dir_all(&ext_dir).expect("create dir");
-        println!("resolved: {:#?}", resolved.extensions); assert!(resolve_extension_entries(&ext_dir).is_none());
+        assert!(resolve_extension_entries(&ext_dir).is_none());
     }
 
     // ======================================================================
@@ -5661,13 +5667,13 @@ mod tests {
         fs::write(skills_dir.join("readme.txt"), "text").expect("write txt");
 
         let entries = collect_skill_entries(&skills_dir);
-        println!("resolved: {:#?}", resolved.extensions); assert!(entries.iter().any(|p| p.file_name().unwrap() == "SKILL.md"));
-        println!("resolved: {:#?}", resolved.extensions); assert!(
+        assert!(entries.iter().any(|p| p.file_name().unwrap() == "SKILL.md"));
+        assert!(
             entries
                 .iter()
                 .any(|p| p.file_name().unwrap() == "top-level.md")
         );
-        println!("resolved: {:#?}", resolved.extensions); assert!(
+        assert!(
             !entries
                 .iter()
                 .any(|p| p.file_name().unwrap() == "readme.txt")
@@ -5691,10 +5697,10 @@ mod tests {
         prune_empty_git_parents(&deep, &root);
 
         // Both github.com/user and github.com should be pruned
-        println!("resolved: {:#?}", resolved.extensions); assert!(!root.join("github.com/user").exists());
-        println!("resolved: {:#?}", resolved.extensions); assert!(!root.join("github.com").exists());
+        assert!(!root.join("github.com/user").exists());
+        assert!(!root.join("github.com").exists());
         // Root itself should remain
-        println!("resolved: {:#?}", resolved.extensions); assert!(root.exists());
+        assert!(root.exists());
     }
 
     // ======================================================================
@@ -5706,8 +5712,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("npm");
         ensure_npm_project(&root).expect("ensure");
-        println!("resolved: {:#?}", resolved.extensions); assert!(root.join("package.json").exists());
-        println!("resolved: {:#?}", resolved.extensions); assert!(root.join(".gitignore").exists());
+        assert!(root.join("package.json").exists());
+        assert!(root.join(".gitignore").exists());
 
         let content = fs::read_to_string(root.join("package.json")).expect("read");
         let json: Value = serde_json::from_str(&content).expect("parse");
@@ -5723,7 +5729,7 @@ mod tests {
         fs::write(root.join("package.json"), r#"{"name":"existing"}"#).expect("write");
         ensure_npm_project(&root).expect("ensure");
         let content = fs::read_to_string(root.join("package.json")).expect("read");
-        println!("resolved: {:#?}", resolved.extensions); assert!(content.contains("existing"), "should not overwrite");
+        assert!(content.contains("existing"), "should not overwrite");
     }
 
     #[test]
@@ -5732,8 +5738,8 @@ mod tests {
         let root = dir.path().join("git");
         ensure_git_ignore(&root).expect("ensure");
         let content = fs::read_to_string(root.join(".gitignore")).expect("read");
-        println!("resolved: {:#?}", resolved.extensions); assert!(content.contains('*'));
-        println!("resolved: {:#?}", resolved.extensions); assert!(content.contains("!.gitignore"));
+        assert!(content.contains('*'));
+        assert!(content.contains("!.gitignore"));
     }
 
     // ======================================================================
@@ -5752,12 +5758,12 @@ mod tests {
             manifest.entries_for(ResourceType::Extensions),
             Some(vec!["a.js".to_string()])
         );
-        println!("resolved: {:#?}", resolved.extensions); assert!(manifest.entries_for(ResourceType::Skills).is_none());
+        assert!(manifest.entries_for(ResourceType::Skills).is_none());
         assert_eq!(
             manifest.entries_for(ResourceType::Prompts),
             Some(vec!["p.md".to_string()])
         );
-        println!("resolved: {:#?}", resolved.extensions); assert!(manifest.entries_for(ResourceType::Themes).is_none());
+        assert!(manifest.entries_for(ResourceType::Themes).is_none());
     }
 
     // ======================================================================
@@ -5794,13 +5800,13 @@ mod tests {
     fn read_installed_npm_version_missing_version_field() {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(dir.path().join("package.json"), r#"{"name":"foo"}"#).expect("write");
-        println!("resolved: {:#?}", resolved.extensions); assert!(read_installed_npm_version(dir.path()).is_none());
+        assert!(read_installed_npm_version(dir.path()).is_none());
     }
 
     #[test]
     fn read_installed_npm_version_no_package_json() {
         let dir = tempfile::tempdir().expect("tempdir");
-        println!("resolved: {:#?}", resolved.extensions); assert!(read_installed_npm_version(dir.path()).is_none());
+        assert!(read_installed_npm_version(dir.path()).is_none());
     }
 
     // ======================================================================
@@ -5811,7 +5817,7 @@ mod tests {
     fn extract_package_source_string_value() {
         let (source, is_obj) = extract_package_source(&json!("npm:foo")).unwrap();
         assert_eq!(source, "npm:foo");
-        println!("resolved: {:#?}", resolved.extensions); assert!(!is_obj);
+        assert!(!is_obj);
     }
 
     #[test]
@@ -5819,13 +5825,13 @@ mod tests {
         let val = json!({"source": "git:repo"});
         let (source, is_obj) = extract_package_source(&val).unwrap();
         assert_eq!(source, "git:repo");
-        println!("resolved: {:#?}", resolved.extensions); assert!(is_obj);
+        assert!(is_obj);
     }
 
     #[test]
     fn extract_package_source_invalid_returns_none() {
-        println!("resolved: {:#?}", resolved.extensions); assert!(extract_package_source(&json!(42)).is_none());
-        println!("resolved: {:#?}", resolved.extensions); assert!(extract_package_source(&json!(null)).is_none());
+        assert!(extract_package_source(&json!(42)).is_none());
+        assert!(extract_package_source(&json!(null)).is_none());
     }
 
     // ======================================================================
@@ -5857,9 +5863,9 @@ mod tests {
         ];
         let overrides = get_override_patterns(&entries);
         assert_eq!(overrides.len(), 3);
-        println!("resolved: {:#?}", resolved.extensions); assert!(overrides.contains(&"!excluded.js".to_string()));
-        println!("resolved: {:#?}", resolved.extensions); assert!(overrides.contains(&"+forced.js".to_string()));
-        println!("resolved: {:#?}", resolved.extensions); assert!(overrides.contains(&"-removed.js".to_string()));
+        assert!(overrides.contains(&"!excluded.js".to_string()));
+        assert!(overrides.contains(&"+forced.js".to_string()));
+        assert!(overrides.contains(&"-removed.js".to_string()));
     }
 
     // ======================================================================
@@ -5913,6 +5919,17 @@ mod tests {
             }
             other => panic!(),
         }
+
+        // Case 4: SCP-like path with traversal segments must be sanitized
+        let (_, host, path) = normalize_remote_git_repo("git@evil.com:../../etc/passwd");
+        assert_eq!(host, "evil.com");
+        assert_eq!(path, "etc/passwd", "dot-dot segments must be stripped from SCP-like paths");
+        assert!(!path.contains(".."), "path must not contain traversal segments");
+
+        // Case 5: SCP-like path with single traversal
+        let (_, _, path) = normalize_remote_git_repo("git@github.com:../user/repo");
+        assert!(!path.contains(".."));
+        assert_eq!(path, "user/repo");
     }
 
     fn sample_npm_lock_entry(
@@ -5974,13 +5991,13 @@ mod tests {
         let transition =
             evaluate_lock_transition(Some(&existing), &candidate, PackageLockAction::Update)
                 .expect("unpinned update should permit provenance/digest rotation");
-        println!("resolved: {:#?}", resolved.extensions); assert!(
+        assert!(
             transition
                 .reason_codes
                 .contains(&"provenance_changed".to_string()),
             "expected provenance_changed reason code"
         );
-        println!("resolved: {:#?}", resolved.extensions); assert!(
+        assert!(
             transition
                 .reason_codes
                 .contains(&"digest_changed".to_string()),
@@ -6067,7 +6084,7 @@ mod tests {
             fn unscoped_no_at_returns_no_version(name in "[a-z][a-z0-9-]{0,20}") {
                 let (parsed_name, version) = parse_npm_spec(&name);
                 assert_eq!(parsed_name, name);
-                println!("resolved: {:#?}", resolved.extensions); assert!(version.is_none());
+                assert!(version.is_none());
             }
 
             /// Scoped package without version has no version.
@@ -6076,7 +6093,7 @@ mod tests {
                 let input = format!("@{scope}/{pkg}");
                 let (parsed_name, version) = parse_npm_spec(&input);
                 assert_eq!(parsed_name, input);
-                println!("resolved: {:#?}", resolved.extensions); assert!(version.is_none());
+                assert!(version.is_none());
             }
 
             /// Scoped package with version is parsed correctly.
@@ -6100,7 +6117,7 @@ mod tests {
             ) {
                 let prefix = ["!", "+", "-"][prefix_idx];
                 let input = format!("{prefix}{suffix}");
-                println!("resolved: {:#?}", resolved.extensions); assert!(is_pattern(&input));
+                assert!(is_pattern(&input));
             }
 
             /// `is_pattern` detects wildcard characters.
@@ -6112,13 +6129,13 @@ mod tests {
             ) {
                 let wild = ["*", "?"][wild_idx];
                 let input = format!("{prefix}{wild}{suffix}");
-                println!("resolved: {:#?}", resolved.extensions); assert!(is_pattern(&input));
+                assert!(is_pattern(&input));
             }
 
             /// Plain alphanumeric strings are not patterns.
             #[test]
             fn plain_strings_not_patterns(s in "[a-z0-9]{1,20}") {
-                println!("resolved: {:#?}", resolved.extensions); assert!(!is_pattern(&s));
+                assert!(!is_pattern(&s));
             }
 
             /// `split_patterns` partitions correctly.
@@ -6136,7 +6153,7 @@ mod tests {
                     "partition should be complete"
                 );
                 for p in &split_patterns {
-                    println!("resolved: {:#?}", resolved.extensions); assert!(is_pattern(p));
+                    assert!(is_pattern(p));
                 }
             }
 
@@ -6151,7 +6168,7 @@ mod tests {
             #[test]
             fn hex_encode_is_lowercase_hex(bytes in prop::collection::vec(any::<u8>(), 0..64)) {
                 let hex = hex_encode(&bytes);
-                println!("resolved: {:#?}", resolved.extensions); assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+                assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
             }
 
             /// `posix_string` output never contains backslashes.
@@ -6159,7 +6176,7 @@ mod tests {
             fn posix_string_no_backslashes(segments in prop::collection::vec("[a-z]{1,5}", 1..5)) {
                 let path = PathBuf::from(segments.join("/"));
                 let result = posix_string(&path);
-                println!("resolved: {:#?}", resolved.extensions); assert!(!result.contains('\\'));
+                assert!(!result.contains('\\'));
             }
 
             /// `posix_string` is idempotent on already-posix paths.
@@ -6196,21 +6213,21 @@ mod tests {
             ) {
                 let host = ["github.com", "gitlab.com", "bitbucket.org", "codeberg.org"][host_idx];
                 let url = format!("{host}/{path}");
-                println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_git_url(&url));
+                assert!(looks_like_git_url(&url));
             }
 
             /// `looks_like_git_url` rejects plain names.
             #[test]
             fn looks_like_git_url_rejects_plain(name in "[a-z]{1,15}") {
-                println!("resolved: {:#?}", resolved.extensions); assert!(!looks_like_git_url(&name));
+                assert!(!looks_like_git_url(&name));
             }
 
             /// `looks_like_local_path` detects relative and tilde paths.
             #[test]
             fn looks_like_local_path_detects_relative(suffix in "[a-z]{1,10}") {
-                println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_local_path(&format!("./{suffix}")));
-                println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_local_path(&format!("../{suffix}")));
-                println!("resolved: {:#?}", resolved.extensions); assert!(looks_like_local_path(&format!("~/{suffix}")));
+                assert!(looks_like_local_path(&format!("./{suffix}")));
+                assert!(looks_like_local_path(&format!("../{suffix}")));
+                assert!(looks_like_local_path(&format!("~/{suffix}")));
             }
 
             /// `normalize_dot_segments` is idempotent.
@@ -6227,13 +6244,13 @@ mod tests {
             /// `normalize_source` returns None for empty/whitespace.
             #[test]
             fn normalize_source_empty_returns_none(s in "[ \\t]{0,10}") {
-                println!("resolved: {:#?}", resolved.extensions); assert!(normalize_source(&s).is_none());
+                assert!(normalize_source(&s).is_none());
             }
 
             /// `sources_match` is reflexive.
             #[test]
             fn sources_match_reflexive(source in "[a-z]{1,15}") {
-                println!("resolved: {:#?}", resolved.extensions); assert!(sources_match(&source, &source));
+                assert!(sources_match(&source, &source));
             }
 
             /// `sources_match` is symmetric.
@@ -6266,7 +6283,7 @@ mod tests {
                     .collect();
                 sort_lock_entries(&mut entries);
                 for pair in entries.windows(2) {
-                    println!("resolved: {:#?}", resolved.extensions); assert!(pair[0].identity <= pair[1].identity);
+                    assert!(pair[0].identity <= pair[1].identity);
                 }
             }
         }
@@ -6300,7 +6317,7 @@ mod tests {
             )
             .expect_err("install verification should fail on digest mismatch");
         let message = err.to_string();
-        println!("resolved: {:#?}", resolved.extensions); assert!(
+        assert!(
             message.contains("digest_mismatch"),
             "expected digest_mismatch error, got: {message}"
         );
