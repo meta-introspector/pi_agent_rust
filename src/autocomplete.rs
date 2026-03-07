@@ -953,7 +953,7 @@ fn is_absolute_dir_path_like(path: &str) -> bool {
     path.starts_with('/')
         || path.starts_with('\\')
         || (path.as_bytes().get(1) == Some(&b':')
-            && matches!(path.as_bytes().get(2), Some(&b'/') | Some(&b'\\')))
+            && matches!(path.as_bytes().get(2), Some(&b'/' | &b'\\')))
 }
 
 fn preferred_path_separator(raw: &str, dir_part_raw: &str) -> char {
