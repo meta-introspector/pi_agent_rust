@@ -334,7 +334,7 @@ impl Config {
 
     /// Resolve the `PI_CONFIG_PATH` override relative to the supplied cwd.
     #[must_use]
-    pub(crate) fn config_path_override_from_env(cwd: &Path) -> Option<PathBuf> {
+    pub fn config_path_override_from_env(cwd: &Path) -> Option<PathBuf> {
         std::env::var_os("PI_CONFIG_PATH")
             .map(PathBuf::from)
             .map(|path| Self::resolve_config_override_path(&path, cwd))

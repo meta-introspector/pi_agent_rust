@@ -438,7 +438,7 @@ fn precedence_sorted_paths(resources: &[ResolvedResource]) -> Vec<PathBuf> {
     enabled.into_iter().map(|resource| resource.path).collect()
 }
 
-fn resource_precedence(resource: &ResolvedResource) -> u8 {
+const fn resource_precedence(resource: &ResolvedResource) -> u8 {
     match (resource.metadata.scope, resource.metadata.origin) {
         (PackageScope::Temporary, _) => 0,
         (PackageScope::Project, ResourceOrigin::TopLevel) => 1,

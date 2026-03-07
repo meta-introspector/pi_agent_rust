@@ -330,7 +330,12 @@ impl SseParser {
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
             let line = line.trim_end_matches('\r');
-            Self::process_line(line, &mut self.current, &mut self.has_data, self.max_event_data_bytes);
+            Self::process_line(
+                line,
+                &mut self.current,
+                &mut self.has_data,
+                self.max_event_data_bytes,
+            );
         }
 
         if self.has_data {
@@ -990,7 +995,11 @@ mod tests {
         // A single data line whose value exceeds the cap must be dropped entirely.
         let mut parser = SseParser::with_max_event_data_bytes(10);
         let events = parser.feed("data: this-is-longer-than-ten-bytes\n\n");
-        assert_eq!(events.len(), 0, "oversized-only event should not emit (no data flag set)");
+        assert_eq!(
+            events.len(),
+            0,
+            "oversized-only event should not emit (no data flag set)"
+        );
     }
 
     #[test]

@@ -2446,7 +2446,7 @@ still frontmatter",
     fn test_merge_resource_paths_keeps_explicit_cli_paths_first() {
         let explicit_path = PathBuf::from("/cli/direct/review.md");
         let merged = merge_resource_paths(
-            &[explicit_path.clone()],
+            std::slice::from_ref(&explicit_path),
             vec![ResolvedResource {
                 path: PathBuf::from("/tmp/cli-ext/review.md"),
                 enabled: true,

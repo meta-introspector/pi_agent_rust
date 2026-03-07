@@ -704,12 +704,7 @@ where
                 summary_index,
                 text,
             } => {
-                self.apply_reasoning_snapshot(
-                    ReasoningKind::Summary,
-                    item_id,
-                    summary_index,
-                    text,
-                );
+                self.apply_reasoning_snapshot(ReasoningKind::Summary, item_id, summary_index, text);
             }
             OpenAIResponsesChunk::ReasoningSummaryPartDone {
                 item_id,
@@ -2058,7 +2053,10 @@ mod tests {
             .collect();
         assert_eq!(
             thinking_deltas,
-            vec![(0, "summary".to_string()), (1, "full reasoning".to_string())]
+            vec![
+                (0, "summary".to_string()),
+                (1, "full reasoning".to_string())
+            ]
         );
 
         let thinking_ends: Vec<(usize, String)> = out
