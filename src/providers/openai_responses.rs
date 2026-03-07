@@ -548,6 +548,58 @@ where
         idx
     }
 
+    fn apply_text_snapshot(&mut self, item_id: String, content_index: u32, text: String) {
+        self.ensure_started();
+        let idx = self.text_block_for(item_id, content_index);
+        let Some(ContentBlock::Text(block)) = self.partial.content.get_mut(idx) else {
+            return;
+        };
+
+        if block.text == text {
+            return;
+        }
+
+        if let Some(suffix) = text.strip_prefix(&block.text) {
+            if suffix.is_empty() {
+                return;
+            }
+            block.text.push_str(suffix);
+            self.pending_events.push_back(StreamEvent::TextDelta {
+                content_index: idx,
+                delta: suffix.to_string(),
+            });
+            return;
+        }
+
+        block.text.clone_from(&text);
+    }
+
+    fn apply_reasoning_snapshot(&mut self, item_id: String, summary_index: u32, text: String) {
+        self.ensure_started();
+        let idx = self.reasoning_block_for(item_id, summary_index);
+        let Some(ContentBlock::Thinking(block)) = self.partial.content.get_mut(idx) else {
+            return;
+        };
+
+        if block.thinking == text {
+            return;
+        }
+
+        if let Some(suffix) = text.strip_prefix(&block.thinking) {
+            if suffix.is_empty() {
+                return;
+            }
+            block.thinking.push_str(suffix);
+            self.pending_events.push_back(StreamEvent::ThinkingDelta {
+                content_index: idx,
+                delta: suffix.to_string(),
+            });
+            return;
+        }
+
+        block.thinking.clone_from(&text);
+    }
+
     #[allow(clippy::too_many_lines)]
     fn process_event(&mut self, data: &str) -> Result<()> {
         let chunk: OpenAIResponsesChunk = serde_json::from_str(data)
@@ -584,6 +636,43 @@ where
                     delta,
                 });
             }
+            OpenAIResponsesChunk::OutputTextDone {
+                item_id,
+                content_index,
+                text,
+            } => {
+                self.apply_text_snapshot(item_id, content_index, text);
+            }
+            OpenAIResponsesChunk::ContentPartDone {
+                item_id,
+                content_index,
+                part,
+            } => match part {
+                OpenAIResponsesContentPartDone::OutputText { text } => {
+                    self.apply_text_snapshot(item_id, content_index, text);
+                }
+                OpenAIResponsesContentPartDone::ReasoningText { text } => {
+                    self.apply_reasoning_snapshot(item_id, content_index, text);
+                }
+                OpenAIResponsesContentPartDone::Unknown => {}
+            },
+            OpenAIResponsesChunk::ReasoningSummaryTextDone {
+                item_id,
+                summary_index,
+                text,
+            } => {
+                self.apply_reasoning_snapshot(item_id, summary_index, text);
+            }
+            OpenAIResponsesChunk::ReasoningSummaryPartDone {
+                item_id,
+                summary_index,
+                part,
+            } => match part {
+                OpenAIResponsesReasoningSummaryPartDone::SummaryText { text } => {
+                    self.apply_reasoning_snapshot(item_id, summary_index, text);
+                }
+                OpenAIResponsesReasoningSummaryPartDone::Unknown => {}
+            },
             OpenAIResponsesChunk::OutputItemAdded { item } => {
                 if let OpenAIResponsesOutputItem::FunctionCall {
                     id,
@@ -1145,17 +1234,41 @@ enum OpenAIResponsesChunk {
         content_index: u32,
         delta: String,
     },
+    #[serde(rename = "response.output_text.done")]
+    OutputTextDone {
+        item_id: String,
+        content_index: u32,
+        text: String,
+    },
     #[serde(rename = "response.output_item.added")]
     OutputItemAdded { item: OpenAIResponsesOutputItem },
     #[serde(rename = "response.output_item.done")]
     OutputItemDone { item: OpenAIResponsesOutputItemDone },
     #[serde(rename = "response.function_call_arguments.delta")]
     FunctionCallArgumentsDelta { item_id: String, delta: String },
+    #[serde(rename = "response.content_part.done")]
+    ContentPartDone {
+        item_id: String,
+        content_index: u32,
+        part: OpenAIResponsesContentPartDone,
+    },
     #[serde(rename = "response.reasoning_summary_text.delta")]
     ReasoningSummaryTextDelta {
         item_id: String,
         summary_index: u32,
         delta: String,
+    },
+    #[serde(rename = "response.reasoning_summary_text.done")]
+    ReasoningSummaryTextDone {
+        item_id: String,
+        summary_index: u32,
+        text: String,
+    },
+    #[serde(rename = "response.reasoning_summary_part.done")]
+    ReasoningSummaryPartDone {
+        item_id: String,
+        summary_index: u32,
+        part: OpenAIResponsesReasoningSummaryPartDone,
     },
     #[serde(rename = "response.completed")]
     ResponseCompleted {
@@ -1175,6 +1288,26 @@ enum OpenAIResponsesChunk {
     },
     #[serde(rename = "error")]
     Error { message: String },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum OpenAIResponsesContentPartDone {
+    #[serde(rename = "output_text")]
+    OutputText { text: String },
+    #[serde(rename = "reasoning_text")]
+    ReasoningText { text: String },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum OpenAIResponsesReasoningSummaryPartDone {
+    #[serde(rename = "summary_text")]
+    SummaryText { text: String },
     #[serde(other)]
     Unknown,
 }
@@ -1612,6 +1745,157 @@ mod tests {
             .expect("tool call end");
         assert_eq!(tool_end.id, "call_5");
         assert_eq!(tool_end.arguments, json!({ "text": "late tool" }));
+    }
+
+    #[test]
+    fn test_stream_materializes_output_text_done_without_deltas() {
+        let events = vec![
+            json!({
+                "type": "response.output_text.done",
+                "item_id": "msg_done",
+                "content_index": 0,
+                "text": "done-only text"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2
+                    }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert!(matches!(out.first(), Some(StreamEvent::Start { .. })));
+        assert!(matches!(
+            out.get(1),
+            Some(StreamEvent::TextStart { content_index: 0 })
+        ));
+        assert!(matches!(
+            out.get(2),
+            Some(StreamEvent::TextDelta {
+                content_index: 0,
+                delta,
+            }) if delta == "done-only text"
+        ));
+        assert!(matches!(
+            out.iter().find(|event| matches!(event, StreamEvent::TextEnd { .. })),
+            Some(StreamEvent::TextEnd {
+                content_index: 0,
+                content,
+            }) if content == "done-only text"
+        ));
+        assert!(matches!(
+            out.last(),
+            Some(StreamEvent::Done {
+                reason: StopReason::Stop,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_stream_backfills_missing_output_text_suffix_from_done_event() {
+        let events = vec![
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_suffix",
+                "content_index": 0,
+                "delta": "Hello"
+            }),
+            json!({
+                "type": "response.output_text.done",
+                "item_id": "msg_suffix",
+                "content_index": 0,
+                "text": "Hello world"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 2,
+                        "total_tokens": 3
+                    }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        let text_deltas: Vec<(usize, String)> = out
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta {
+                    content_index,
+                    delta,
+                } => Some((*content_index, delta.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text_deltas,
+            vec![(0, "Hello".to_string()), (0, " world".to_string())]
+        );
+        assert!(matches!(
+            out.iter().find(|event| matches!(event, StreamEvent::TextEnd { .. })),
+            Some(StreamEvent::TextEnd {
+                content_index: 0,
+                content,
+            }) if content == "Hello world"
+        ));
+    }
+
+    #[test]
+    fn test_stream_materializes_reasoning_summary_part_done_without_deltas() {
+        let events = vec![
+            json!({
+                "type": "response.reasoning_summary_part.done",
+                "item_id": "rs_done",
+                "summary_index": 0,
+                "part": {
+                    "type": "summary_text",
+                    "text": "Plan first, answer second."
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2
+                    }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert!(matches!(out.first(), Some(StreamEvent::Start { .. })));
+        assert!(matches!(
+            out.get(1),
+            Some(StreamEvent::ThinkingStart { content_index: 0 })
+        ));
+        assert!(matches!(
+            out.get(2),
+            Some(StreamEvent::ThinkingDelta {
+                content_index: 0,
+                delta,
+            }) if delta == "Plan first, answer second."
+        ));
+        assert!(matches!(
+            out.iter()
+                .find(|event| matches!(event, StreamEvent::ThinkingEnd { .. })),
+            Some(StreamEvent::ThinkingEnd {
+                content_index: 0,
+                content,
+            }) if content == "Plan first, answer second."
+        ));
     }
 
     #[test]
