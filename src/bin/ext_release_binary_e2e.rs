@@ -5,13 +5,13 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -356,24 +356,26 @@ fn execute_cases(
         for _ in 0..jobs {
             let tx = tx.clone();
             let next_index = Arc::clone(&next_index);
-            scope.spawn(move || loop {
-                let index = next_index.fetch_add(1, Ordering::Relaxed);
-                if index >= total {
-                    break;
-                }
-                let entry = &selected[index];
-                let result = run_one_case(
-                    entry,
-                    args,
-                    project_root,
-                    artifacts_root,
-                    pi_bin,
-                    per_case_dir,
-                )
-                .with_context(|| format!("running extension case '{}'", entry.id))
-                .map(|case| (index, case));
-                if tx.send(result).is_err() {
-                    break;
+            scope.spawn(move || {
+                loop {
+                    let index = next_index.fetch_add(1, Ordering::Relaxed);
+                    if index >= total {
+                        break;
+                    }
+                    let entry = &selected[index];
+                    let result = run_one_case(
+                        entry,
+                        args,
+                        project_root,
+                        artifacts_root,
+                        pi_bin,
+                        per_case_dir,
+                    )
+                    .with_context(|| format!("running extension case '{}'", entry.id))
+                    .map(|case| (index, case));
+                    if tx.send(result).is_err() {
+                        break;
+                    }
                 }
             });
         }

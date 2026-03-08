@@ -227,11 +227,3 @@ module_name_repetitions = "allow"
 # charmed-harmonica = { path = "../charmed_rust/crates/harmonica" }
 # sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
 # sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
-
-# TODO(issue #5): The local charmed-bubbletea patch added `try_downcast()` which
-# is not yet in the published crate (0.2.0).  Once charmed-bubbletea is
-# republished with that method, remove the `try_downcast` workaround in
-# src/interactive.rs and delete this commented block.
-#
-# [patch.crates-io]
-# charmed-bubbletea = { path = "../charmed_rust/crates/bubbletea" }
