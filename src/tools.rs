@@ -2889,40 +2889,42 @@ impl Tool for EditTool {
         }
 
         // Atomic write (safe improvement vs legacy, behavior-equivalent).
-        // Capture original permissions before the file is replaced.
-        let original_perms = std::fs::metadata(&absolute_path)
-            .ok()
-            .map(|m| m.permissions());
-        let parent = absolute_path.parent().unwrap_or_else(|| Path::new("."));
-        let mut temp_file = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|e| Error::tool("edit", format!("Failed to create temp file: {e}")))?;
-        temp_file
-            .as_file_mut()
-            .write_all(final_content.as_bytes())
-            .map_err(|e| Error::tool("edit", format!("Failed to write temp file: {e}")))?;
+        let absolute_path_clone = absolute_path.clone();
+        let final_content_bytes = final_content.into_bytes();
+        asupersync::runtime::spawn_blocking_io(move || {
+            // Capture original permissions before the file is replaced.
+            let original_perms = std::fs::metadata(&absolute_path_clone)
+                .ok()
+                .map(|m| m.permissions());
+            let parent = absolute_path_clone
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
 
-        temp_file
-            .as_file_mut()
-            .sync_all()
-            .map_err(|e| Error::tool("edit", format!("Failed to sync temp file: {e}")))?;
+            temp_file.as_file_mut().write_all(&final_content_bytes)?;
+            temp_file.as_file_mut().sync_all()?;
 
-        // Restore original file permissions (tempfile defaults to 0o600) before persisting.
-        if let Some(perms) = original_perms {
-            let _ = temp_file.as_file().set_permissions(perms);
-        } else {
-            // Default to 0644 (rw-r--r--) instead of tempfile's 0600 if we couldn't read original perms.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = temp_file
-                    .as_file()
-                    .set_permissions(std::fs::Permissions::from_mode(0o644));
+            // Restore original file permissions (tempfile defaults to 0o600) before persisting.
+            if let Some(perms) = original_perms {
+                let _ = temp_file.as_file().set_permissions(perms);
+            } else {
+                // Default to 0644 (rw-r--r--) instead of tempfile's 0600 if we couldn't read original perms.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = temp_file
+                        .as_file()
+                        .set_permissions(std::fs::Permissions::from_mode(0o644));
+                }
             }
-        }
 
-        temp_file
-            .persist(&absolute_path)
-            .map_err(|e| Error::tool("edit", format!("Failed to persist file: {e}")))?;
+            temp_file
+                .persist(&absolute_path_clone)
+                .map_err(|e| e.error)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::tool("edit", format!("Failed to write file: {e}")))?;
 
         let (diff, first_changed_line) =
             generate_diff_string(&normalized_content, &new_content_for_diff);
@@ -3039,41 +3041,38 @@ impl Tool for WriteTool {
         // Parity with legacy pi-mono: report JS string length (UTF-16 code units) as "bytes".
         let bytes_written = input.content.encode_utf16().count();
 
-        // Write atomically using tempfile
-        // Capture original permissions before the file is replaced (new files get None).
-        let original_perms = std::fs::metadata(&path).ok().map(|m| m.permissions());
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut temp_file = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|e| Error::tool("write", format!("Failed to create temp file: {e}")))?;
+        // Write atomically using tempfile on a blocking thread
+        let path_clone = path.clone();
+        let content_bytes = input.content.into_bytes();
+        asupersync::runtime::spawn_blocking_io(move || {
+            // Capture original permissions before the file is replaced (new files get None).
+            let original_perms = std::fs::metadata(&path_clone).ok().map(|m| m.permissions());
+            let parent = path_clone.parent().unwrap_or_else(|| Path::new("."));
+            let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
 
-        temp_file
-            .as_file_mut()
-            .write_all(input.content.as_bytes())
-            .map_err(|e| Error::tool("write", format!("Failed to write temp file: {e}")))?;
+            temp_file.as_file_mut().write_all(&content_bytes)?;
+            temp_file.as_file_mut().sync_all()?;
 
-        temp_file
-            .as_file_mut()
-            .sync_all()
-            .map_err(|e| Error::tool("write", format!("Failed to sync temp file: {e}")))?;
-
-        // Restore original file permissions (tempfile defaults to 0o600) before persisting.
-        if let Some(perms) = original_perms {
-            let _ = temp_file.as_file().set_permissions(perms);
-        } else {
-            // New file: default to 0644 (rw-r--r--) instead of tempfile's 0600.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = temp_file
-                    .as_file()
-                    .set_permissions(std::fs::Permissions::from_mode(0o644));
+            // Restore original file permissions (tempfile defaults to 0o600) before persisting.
+            if let Some(perms) = original_perms {
+                let _ = temp_file.as_file().set_permissions(perms);
+            } else {
+                // New file: default to 0644 (rw-r--r--) instead of tempfile's 0600.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = temp_file
+                        .as_file()
+                        .set_permissions(std::fs::Permissions::from_mode(0o644));
+                }
             }
-        }
 
-        // Persist (atomic rename)
-        temp_file
-            .persist(&path)
-            .map_err(|e| Error::tool("write", format!("Failed to persist file: {e}")))?;
+            // Persist (atomic rename)
+            temp_file.persist(&path_clone).map_err(|e| e.error)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::tool("write", format!("Failed to write file: {e}")))?;
 
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(format!(
@@ -5354,38 +5353,39 @@ impl Tool for HashlineEditTool {
         }
 
         // Atomic write (same pattern as EditTool)
-        let original_perms = std::fs::metadata(&absolute_path)
-            .ok()
-            .map(|m| m.permissions());
-        let parent = absolute_path.parent().unwrap_or_else(|| Path::new("."));
-        let mut temp_file = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
-            Error::tool("hashline_edit", format!("Failed to create temp file: {e}"))
-        })?;
-        temp_file
-            .as_file_mut()
-            .write_all(final_content.as_bytes())
-            .map_err(|e| Error::tool("hashline_edit", format!("Failed to write temp file: {e}")))?;
+        let absolute_path_clone = absolute_path.clone();
+        let final_content_bytes = final_content.into_bytes();
+        asupersync::runtime::spawn_blocking_io(move || {
+            let original_perms = std::fs::metadata(&absolute_path_clone)
+                .ok()
+                .map(|m| m.permissions());
+            let parent = absolute_path_clone
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
 
-        temp_file
-            .as_file_mut()
-            .sync_all()
-            .map_err(|e| Error::tool("hashline_edit", format!("Failed to sync temp file: {e}")))?;
+            temp_file.as_file_mut().write_all(&final_content_bytes)?;
+            temp_file.as_file_mut().sync_all()?;
 
-        if let Some(perms) = original_perms {
-            let _ = temp_file.as_file().set_permissions(perms);
-        } else {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = temp_file
-                    .as_file()
-                    .set_permissions(std::fs::Permissions::from_mode(0o644));
+            if let Some(perms) = original_perms {
+                let _ = temp_file.as_file().set_permissions(perms);
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = temp_file
+                        .as_file()
+                        .set_permissions(std::fs::Permissions::from_mode(0o644));
+                }
             }
-        }
 
-        temp_file
-            .persist(&absolute_path)
-            .map_err(|e| Error::tool("hashline_edit", format!("Failed to persist file: {e}")))?;
+            temp_file
+                .persist(&absolute_path_clone)
+                .map_err(|e| e.error)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::tool("hashline_edit", format!("Failed to write file: {e}")))?;
 
         // Generate diff
         let (diff, first_changed_line) = generate_diff_string(&normalized, &new_normalized);
