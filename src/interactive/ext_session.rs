@@ -578,6 +578,15 @@ mod tests {
     use std::path::Path;
     use std::pin::Pin;
 
+    type TestStream =
+        Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>;
+    type HostActionsHarness = (
+        InteractiveExtensionHostActions,
+        mpsc::Receiver<PiMsg>,
+        Arc<Mutex<Session>>,
+        Arc<Mutex<Agent>>,
+    );
+
     struct NoopProvider;
 
     #[async_trait]
@@ -598,19 +607,12 @@ mod tests {
             &self,
             _context: &Context<'_>,
             _options: &StreamOptions,
-        ) -> crate::error::Result<
-            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
-        > {
+        ) -> crate::error::Result<TestStream> {
             Ok(Box::pin(stream::empty()))
         }
     }
 
-    fn build_host_actions() -> (
-        InteractiveExtensionHostActions,
-        mpsc::Receiver<PiMsg>,
-        Arc<Mutex<Session>>,
-        Arc<Mutex<Agent>>,
-    ) {
+    fn build_host_actions() -> HostActionsHarness {
         let session = Arc::new(Mutex::new(Session::in_memory()));
         let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
         let agent = Arc::new(Mutex::new(Agent::new(
