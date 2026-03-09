@@ -4730,6 +4730,14 @@ struct PiJsModuleState {
     /// Package scope (`@scope`) per extension root (when discoverable from
     /// package.json name). Pattern 4 allows same-scope packages.
     extension_root_scopes: HashMap<PathBuf, String>,
+    /// Canonical extension roots grouped by extension id for runtime
+    /// filesystem access checks. This keeps sync host reads/writes scoped to
+    /// the currently executing extension instead of all registered roots.
+    extension_roots_by_id: HashMap<String, Vec<PathBuf>>,
+    /// Canonical extension roots registered without extension metadata.
+    /// These remain available to the active extension for legacy callers that
+    /// still use `add_extension_root()`.
+    extension_roots_without_id: Vec<PathBuf>,
     /// Shared handle for recording repair events from the resolver.
     repair_events: Arc<std::sync::Mutex<Vec<ExtensionRepairEvent>>>,
     /// Directory for persistent transpiled-source disk cache.
@@ -4770,6 +4778,8 @@ impl PiJsModuleState {
             canonical_extension_roots: Vec::new(),
             extension_root_tiers: HashMap::new(),
             extension_root_scopes: HashMap::new(),
+            extension_roots_by_id: HashMap::new(),
+            extension_roots_without_id: Vec::new(),
             repair_events: Arc::new(std::sync::Mutex::new(Vec::new())),
             disk_cache_dir: None,
         }
@@ -4792,6 +4802,50 @@ impl PiJsModuleState {
         self.disk_cache_dir = dir;
         self
     }
+}
+
+fn current_extension_id(ctx: &Ctx<'_>) -> Option<String> {
+    ctx.globals()
+        .get::<_, Option<String>>("__pi_current_extension_id")
+        .ok()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn extension_roots_for_fs_access(
+    extension_id: Option<&str>,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+    fallback_roots: &Arc<std::sync::Mutex<Vec<PathBuf>>>,
+) -> Vec<PathBuf> {
+    if let Some(extension_id) = extension_id {
+        let state = module_state.borrow();
+        let mut roots = state.extension_roots_without_id.clone();
+        if let Some(scoped_roots) = state.extension_roots_by_id.get(extension_id) {
+            for root in scoped_roots {
+                if !roots.contains(root) {
+                    roots.push(root.clone());
+                }
+            }
+        }
+        return roots;
+    }
+
+    fallback_roots
+        .lock()
+        .map(|roots| roots.clone())
+        .unwrap_or_default()
+}
+
+fn path_is_in_allowed_extension_root(
+    path: &Path,
+    extension_id: Option<&str>,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+    fallback_roots: &Arc<std::sync::Mutex<Vec<PathBuf>>>,
+) -> bool {
+    extension_roots_for_fs_access(extension_id, module_state, fallback_roots)
+        .iter()
+        .any(|root| path.starts_with(root))
 }
 
 #[derive(Clone, Debug)]
@@ -5427,6 +5481,21 @@ impl JsModuleResolver for PiJsResolver {
 
                 return Ok(spec.to_string());
             }
+        }
+
+        let canonical_roots = {
+            let state = self.state.borrow();
+            state.canonical_extension_roots.clone()
+        };
+        if let Some(escaped_path) = detect_monorepo_escape(base, spec, &canonical_roots) {
+            return Err(rquickjs::Error::new_resolving_message(
+                base,
+                name,
+                format!(
+                    "Module path escapes extension root: {}",
+                    escaped_path.display()
+                ),
+            ));
         }
 
         Err(rquickjs::Error::new_resolving_message(
@@ -13167,8 +13236,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             state.dynamic_virtual_modules.clear();
             state.dynamic_virtual_named_exports.clear();
             state.extension_roots.clear();
+            state.canonical_extension_roots.clear();
             state.extension_root_tiers.clear();
             state.extension_root_scopes.clear();
+            state.extension_roots_by_id.clear();
+            state.extension_roots_without_id.clear();
 
             for spec in dynamic_specs {
                 if state.compiled_sources.remove(&spec).is_some() {
@@ -13297,8 +13369,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     pub fn reset_transient_state(&self) {
         let mut state = self.module_state.borrow_mut();
         state.extension_roots.clear();
+        state.canonical_extension_roots.clear();
         state.extension_root_tiers.clear();
         state.extension_root_scopes.clear();
+        state.extension_roots_by_id.clear();
+        state.extension_roots_without_id.clear();
         state.dynamic_virtual_modules.clear();
         state.dynamic_virtual_named_exports.clear();
         state.module_cache_counters = ModuleCacheCounters::default();
@@ -13808,13 +13883,24 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// apply stricter policy for official/first-party extensions and to allow
     /// same-scope package imports (`@scope/*`) when scope can be discovered.
     pub fn add_extension_root_with_id(&self, root: PathBuf, extension_id: Option<&str>) {
-        self.add_allowed_read_root(&root);
+        let canonical_root = crate::extensions::safe_canonicalize(&root);
+        self.add_allowed_read_root(&canonical_root);
         let mut state = self.module_state.borrow_mut();
         if !state.extension_roots.contains(&root) {
-            state
-                .canonical_extension_roots
-                .push(crate::extensions::safe_canonicalize(&root));
+            state.canonical_extension_roots.push(canonical_root.clone());
             state.extension_roots.push(root.clone());
+        }
+
+        if let Some(extension_id) = extension_id {
+            let roots = state
+                .extension_roots_by_id
+                .entry(extension_id.to_string())
+                .or_default();
+            if !roots.contains(&canonical_root) {
+                roots.push(canonical_root);
+            }
+        } else if !state.extension_roots_without_id.contains(&canonical_root) {
+            state.extension_roots_without_id.push(canonical_root);
         }
 
         let tier = extension_id.map_or_else(
@@ -13844,6 +13930,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let repair_events = Arc::clone(&self.repair_events);
         let allow_unsafe_sync_exec = self.config.allow_unsafe_sync_exec;
         let allowed_read_roots = Arc::clone(&self.allowed_read_roots);
+        let module_state = Rc::clone(&self.module_state);
         let policy = self.policy.clone();
 
         self.context
@@ -14468,14 +14555,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let process_cwd = process_cwd.clone();
                         let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
                         move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<()> {
-                            let extension_id: Option<String> = ctx
-                                .globals()
-                                .get::<_, Option<String>>("__pi_current_extension_id")
-                                .ok()
-                                .flatten()
-                                .map(|value| value.trim().to_string())
-                                .filter(|value| !value.is_empty());
+                            let extension_id = current_extension_id(&ctx);
 
                             // Keep standalone PiJsRuntime unit harness behavior unchanged.
                             if extension_id.is_none() {
@@ -14492,11 +14574,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             };
                             let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
 
-                            let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
-                                roots.iter().any(|root| {
-                                    checked_path.starts_with(root)
-                                })
-                            });
+                            let in_ext_root = path_is_in_allowed_extension_root(
+                                &checked_path,
+                                extension_id.as_deref(),
+                                &module_state,
+                                &allowed_read_roots,
+                            );
 
                             let allowed = checked_path.starts_with(&workspace_root) || in_ext_root;
 
@@ -14522,10 +14605,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let process_cwd = process_cwd.clone();
                         let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
                         let configured_repair_mode = repair_mode;
                         let repair_events = Arc::clone(&repair_events);
-                        move |path: String| -> rquickjs::Result<String> {
+                        move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<String> {
                             const MAX_SYNC_READ_SIZE: u64 = 64 * 1024 * 1024; // 64MB hard limit
+                            let extension_id = current_extension_id(&ctx);
 
                             let workspace_root =
                                 crate::extensions::safe_canonicalize(Path::new(&process_cwd));
@@ -14538,9 +14623,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             };
 
                             let apply_missing_asset_fallback = |checked_path: &Path, error_msg: &str| -> rquickjs::Result<String> {
-                                let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
-                                    roots.iter().any(|root| checked_path.starts_with(root))
-                                });
+                                let in_ext_root = path_is_in_allowed_extension_root(
+                                    checked_path,
+                                    extension_id.as_deref(),
+                                    &module_state,
+                                    &allowed_read_roots,
+                                );
 
                                 if in_ext_root {
                                     let ext = checked_path
@@ -14569,7 +14657,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                                     if let Ok(mut events) = repair_events.lock() {
                                         events.push(ExtensionRepairEvent {
-                                            extension_id: String::new(),
+                                            extension_id: extension_id.clone().unwrap_or_default(),
                                             pattern: RepairPattern::MissingAsset,
                                             original_error: format!("ENOENT: {}", checked_path.display()),
                                             repair_action: format!("returned empty {ext} fallback"),
@@ -14604,9 +14692,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         // Pattern 2 (bd-k5q5.8.3): missing asset fallback.
                                         let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
 
-                                        let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
-                                            roots.iter().any(|root| checked_path.starts_with(root))
-                                        });
+                                        let in_ext_root = path_is_in_allowed_extension_root(
+                                            &checked_path,
+                                            extension_id.as_deref(),
+                                            &module_state,
+                                            &allowed_read_roots,
+                                        );
                                         let allowed = checked_path.starts_with(&workspace_root) || in_ext_root;
 
                                         if !allowed {
@@ -14639,11 +14730,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 let secure_path =
                                     crate::extensions::strip_unc_prefix(secure_path_buf);
 
-                                let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
-                                    roots.iter().any(|root| {
-                                        secure_path.starts_with(root)
-                                    })
-                                });
+                                let in_ext_root = path_is_in_allowed_extension_root(
+                                    &secure_path,
+                                    extension_id.as_deref(),
+                                    &module_state,
+                                    &allowed_read_roots,
+                                );
                                 let allowed =
                                     secure_path.starts_with(&workspace_root) || in_ext_root;
 
@@ -14681,11 +14773,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                                 // Allow reads from workspace root or any registered
                                 // extension root directory.
-                                let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
-                                    roots.iter().any(|root| {
-                                        checked_path.starts_with(root)
-                                    })
-                                });
+                                let in_ext_root = path_is_in_allowed_extension_root(
+                                    &checked_path,
+                                    extension_id.as_deref(),
+                                    &module_state,
+                                    &allowed_read_roots,
+                                );
                                 let allowed =
                                     checked_path.starts_with(&workspace_root) || in_ext_root;
 
@@ -19237,8 +19330,11 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             {
                 let state = runtime.module_state.borrow();
                 assert!(state.extension_roots.is_empty());
+                assert!(state.canonical_extension_roots.is_empty());
                 assert!(state.extension_root_tiers.is_empty());
                 assert!(state.extension_root_scopes.is_empty());
+                assert!(state.extension_roots_by_id.is_empty());
+                assert!(state.extension_roots_without_id.is_empty());
                 assert!(state.dynamic_virtual_modules.is_empty());
                 assert!(state.dynamic_virtual_named_exports.is_empty());
 
@@ -19308,6 +19404,32 @@ import { isIPv4 as netIsIpv4 } from "node:net";
         pool.record_reset();
         pool.record_reset();
         assert_eq!(pool.reset_count(), 2);
+    }
+
+    #[test]
+    fn warm_reset_clears_canonical_and_per_extension_roots() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let root = temp_dir.path().join("ext");
+            std::fs::create_dir_all(&root).expect("mkdir ext");
+            runtime.add_extension_root_with_id(root.clone(), Some("ext.reset.roots"));
+
+            let report = runtime
+                .reset_for_warm_reload()
+                .await
+                .expect("warm reset should run");
+            assert!(report.reused, "expected warm reuse, got report: {report:?}");
+
+            let state = runtime.module_state.borrow();
+            assert!(state.extension_roots.is_empty());
+            assert!(state.canonical_extension_roots.is_empty());
+            assert!(state.extension_roots_by_id.is_empty());
+            assert!(state.extension_roots_without_id.is_empty());
+        });
     }
 
     #[test]
@@ -21639,6 +21761,189 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(
                 get_global_json(&runtime, "extBData").await,
                 serde_json::json!("from-B")
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_host_read_denies_cross_extension_root_access() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_a = temp_dir.path().join("ext-a");
+            let ext_b = temp_dir.path().join("ext-b");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_a).expect("mkdir ext-a");
+            std::fs::create_dir_all(&ext_b).expect("mkdir ext-b");
+            let secret_path = ext_a.join("secret.txt");
+            std::fs::write(&secret_path, "top-secret").expect("write secret");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_a, Some("ext.a"));
+            runtime.add_extension_root_with_id(ext_b, Some("ext.b"));
+
+            let script = format!(
+                r#"
+                globalThis.crossExtensionRead = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    return __pi_with_extension_async("ext.b", async () => {{
+                        try {{
+                            globalThis.crossExtensionRead.value = fs.readFileSync({secret_path:?}, 'utf8');
+                            globalThis.crossExtensionRead.ok = true;
+                        }} catch (err) {{
+                            globalThis.crossExtensionRead.ok = false;
+                            globalThis.crossExtensionRead.error = String((err && err.message) || err || '');
+                        }}
+                    }});
+                }}).finally(() => {{
+                    globalThis.crossExtensionRead.done = true;
+                }});
+                "#
+            );
+            runtime
+                .eval(&script)
+                .await
+                .expect("eval cross-extension read");
+
+            let result = get_global_json(&runtime, "crossExtensionRead").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["ok"], serde_json::json!(false));
+            let error = result["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("host read denied"),
+                "expected host read denial, got: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_host_read_allows_idless_extension_root_for_active_extension() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_root = temp_dir.path().join("ext");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_root).expect("mkdir ext");
+            let asset_path = ext_root.join("asset.txt");
+            std::fs::write(&asset_path, "legacy-root-access").expect("write asset");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root(ext_root);
+
+            let script = format!(
+                r#"
+                globalThis.legacyRootRead = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    return __pi_with_extension_async("ext.legacy", async () => {{
+                        try {{
+                            globalThis.legacyRootRead.value = fs.readFileSync({asset_path:?}, 'utf8');
+                            globalThis.legacyRootRead.ok = true;
+                        }} catch (err) {{
+                            globalThis.legacyRootRead.ok = false;
+                            globalThis.legacyRootRead.error = String((err && err.message) || err || '');
+                        }}
+                    }});
+                }}).finally(() => {{
+                    globalThis.legacyRootRead.done = true;
+                }});
+                "#
+            );
+            runtime
+                .eval(&script)
+                .await
+                .expect("eval id-less extension root read");
+
+            let result = get_global_json(&runtime, "legacyRootRead").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["ok"], serde_json::json!(true));
+            assert_eq!(result["value"], serde_json::json!("legacy-root-access"));
+        });
+    }
+
+    #[test]
+    fn pijs_host_write_denies_cross_extension_root_access() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_a = temp_dir.path().join("ext-a");
+            let ext_b = temp_dir.path().join("ext-b");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_a).expect("mkdir ext-a");
+            std::fs::create_dir_all(&ext_b).expect("mkdir ext-b");
+            let target_path = ext_a.join("owned.txt");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_a, Some("ext.a"));
+            runtime.add_extension_root_with_id(ext_b, Some("ext.b"));
+
+            let script = format!(
+                r#"
+                globalThis.crossExtensionWrite = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    return __pi_with_extension_async("ext.b", async () => {{
+                        try {{
+                            fs.writeFileSync({target_path:?}, 'owned');
+                            globalThis.crossExtensionWrite.ok = true;
+                        }} catch (err) {{
+                            globalThis.crossExtensionWrite.ok = false;
+                            globalThis.crossExtensionWrite.error = String((err && err.message) || err || '');
+                        }}
+                        globalThis.crossExtensionWrite.exists = fs.existsSync({target_path:?});
+                    }});
+                }}).finally(() => {{
+                    globalThis.crossExtensionWrite.done = true;
+                }});
+                "#
+            );
+            runtime
+                .eval(&script)
+                .await
+                .expect("eval cross-extension write");
+
+            let result = get_global_json(&runtime, "crossExtensionWrite").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["ok"], serde_json::json!(false));
+            assert_eq!(result["exists"], serde_json::json!(false));
+            let error = result["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("host write denied"),
+                "expected host write denial, got: {error}"
             );
         });
     }

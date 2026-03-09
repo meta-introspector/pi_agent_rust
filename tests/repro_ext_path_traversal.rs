@@ -26,19 +26,30 @@ fn repro_ext_path_traversal() {
         // Register extension root
         runtime.add_extension_root(ext_root.clone());
 
-        // Try to evaluate the module
-        let result = runtime.eval_file(&index_file).await;
+        // Use dynamic import because `eval()`/`eval_file()` run as scripts, not modules.
+        let script = format!(
+            r"
+            globalThis.traversalAttempt = {{}};
+            import({index_file:?}).then(() => {{
+                globalThis.traversalAttempt.ok = true;
+            }}).catch((err) => {{
+                globalThis.traversalAttempt.ok = false;
+                globalThis.traversalAttempt.error = String((err && err.message) || err || '');
+            }}).finally(() => {{
+                globalThis.traversalAttempt.done = true;
+            }});
+            "
+        );
+        runtime.eval(&script).await.unwrap();
 
-        // We expect this to FAIL with "Module path escapes extension root"
-        match result {
-            Ok(()) => panic!("Should have failed to import module outside root, but succeeded!"),
-            Err(e) => {
-                println!("Got expected error: {e}");
-                assert!(
-                    e.to_string().contains("Module path escapes extension root"),
-                    "Unexpected error message: {e}",
-                );
-            }
-        }
+        let result = runtime.read_global_json("traversalAttempt").await.unwrap();
+        assert_eq!(result["done"], serde_json::json!(true));
+        assert_eq!(result["ok"], serde_json::json!(false));
+        let error = result["error"].as_str().unwrap_or_default();
+        println!("Got expected error: {error}");
+        assert!(
+            error.contains("Module path escapes extension root") && error.contains("secret.js"),
+            "Unexpected error message: {error}",
+        );
     });
 }
