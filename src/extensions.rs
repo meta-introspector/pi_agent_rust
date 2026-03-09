@@ -23941,39 +23941,82 @@ fn normalize_semver_literal(input: &str) -> Option<String> {
 
 fn normalize_version_requirement(range: &str) -> Option<String> {
     let mut tokens = Vec::new();
-    for raw_token in range.split_whitespace() {
-        let token = raw_token.trim();
-        if token.is_empty() {
-            continue;
+    let mut remaining = range.trim();
+    if remaining.is_empty() {
+        return None;
+    }
+    loop {
+        remaining = remaining.trim_start();
+        if remaining.is_empty() {
+            break;
         }
-        if token == "*" {
+        if remaining == "*" {
             tokens.push("*".to_string());
-            continue;
+            break;
         }
 
-        let (op, version) = if let Some(rest) = token.strip_prefix(">=") {
-            (">=", rest)
-        } else if let Some(rest) = token.strip_prefix("<=") {
-            ("<=", rest)
-        } else if let Some(rest) = token.strip_prefix('>') {
-            (">", rest)
-        } else if let Some(rest) = token.strip_prefix('<') {
-            ("<", rest)
-        } else if let Some(rest) = token.strip_prefix('^') {
-            ("^", rest)
-        } else if let Some(rest) = token.strip_prefix('~') {
-            ("~", rest)
-        } else if let Some(rest) = token.strip_prefix('=') {
-            ("=", rest)
-        } else {
-            ("=", token)
-        };
+        let (op, version_and_rest) = [
+            (">=", remaining.strip_prefix(">=")),
+            ("<=", remaining.strip_prefix("<=")),
+            (">", remaining.strip_prefix('>')),
+            ("<", remaining.strip_prefix('<')),
+            ("^", remaining.strip_prefix('^')),
+            ("~", remaining.strip_prefix('~')),
+            ("=", remaining.strip_prefix('=')),
+        ]
+        .into_iter()
+        .find_map(|(op, version)| version.map(|value| (op, value)))
+        .unwrap_or(("=", remaining));
 
+        let version_and_rest = version_and_rest.trim_start();
+        if version_and_rest.is_empty() {
+            return None;
+        }
+        let version_end = version_and_rest
+            .find(|ch: char| ch.is_whitespace() || ch == ',')
+            .unwrap_or(version_and_rest.len());
+        let version = &version_and_rest[..version_end];
         let normalized_version = normalize_semver_literal(version)?;
         tokens.push(format!("{op}{normalized_version}"));
+        remaining = &version_and_rest[version_end..];
+
+        let mut saw_separator = false;
+        let mut saw_comma = false;
+        while let Some(ch) = remaining.chars().next() {
+            if ch.is_whitespace() {
+                saw_separator = true;
+                remaining = &remaining[ch.len_utf8()..];
+                continue;
+            }
+            if ch == ',' {
+                saw_separator = true;
+                saw_comma = true;
+                remaining = &remaining[ch.len_utf8()..];
+                continue;
+            }
+            break;
+        }
+
+        if remaining.is_empty() {
+            if saw_comma {
+                return None;
+            }
+            break;
+        }
+        if !saw_separator {
+            return None;
+        }
     }
 
     (!tokens.is_empty()).then(|| tokens.join(", "))
+}
+
+fn looks_like_plain_semver_literal(range: &str) -> bool {
+    let trimmed = range.trim();
+    !trimmed.is_empty()
+        && !trimmed.chars().any(|ch| {
+            ch.is_whitespace() || matches!(ch, ',' | '^' | '~' | '>' | '<' | '=' | '*' | '|')
+        })
 }
 
 fn check_version_constraint(version: &str, range: &str) -> bool {
@@ -23985,14 +24028,17 @@ fn check_version_constraint(version: &str, range: &str) -> bool {
     let Some(version) = normalize_semver_literal(version) else {
         return false;
     };
-    let Some(range) = normalize_version_requirement(range) else {
-        return false;
-    };
-
     let Ok(version) = Version::parse(&version) else {
         return false;
     };
-    VersionReq::parse(&range).is_ok_and(|req| req.matches(&version))
+    if let Some(range) = normalize_version_requirement(range) {
+        return VersionReq::parse(&range).is_ok_and(|req| req.matches(&version));
+    }
+    if looks_like_plain_semver_literal(range) {
+        return false;
+    }
+
+    VersionReq::parse(range).is_ok_and(|req| req.matches(&version))
 }
 
 impl ExtensionManager {
@@ -24053,7 +24099,7 @@ impl ExtensionManager {
     }
 
     fn load_persisted_permissions_from(inner: &mut ExtensionManagerInner, path: &Path) {
-        match PermissionStore::open(&path) {
+        match PermissionStore::open(path) {
             Ok(store) => {
                 // Seed the in-memory cache from persisted decisions.
                 inner.policy_prompt_cache = store.to_decision_cache();
@@ -24061,7 +24107,7 @@ impl ExtensionManager {
             }
             Err(e) => {
                 tracing::warn!("Failed to load extension permissions: {e}");
-                inner.permission_store = Some(PermissionStore::empty_at(&path));
+                inner.permission_store = Some(PermissionStore::empty_at(path));
             }
         }
     }
@@ -31169,9 +31215,12 @@ mod tests {
     #[test]
     fn check_version_constraint_accepts_compound_range() {
         assert!(check_version_constraint("2.5.1", ">=2.0.0 <3.0.0"));
+        assert!(check_version_constraint("2.5.1", ">=2.0.0, <3.0.0"));
+        assert!(check_version_constraint("2.5.1", ">= 2.0.0, < 3.0.0"));
         assert!(!check_version_constraint("3.0.0", ">=2.0.0 <3.0.0"));
         assert!(check_version_constraint("1.2.4", ">1.2.3 <=2.0.0"));
         assert!(!check_version_constraint("1.2.3", ">1.2.3 <=2.0.0"));
+        assert!(!check_version_constraint("2.5.1", ">=2.0.0,"));
     }
 
     #[test]
@@ -31180,6 +31229,15 @@ mod tests {
         assert!(!check_version_constraint("2.0.0-beta.2", "2.0.0-beta.1"));
         assert!(!check_version_constraint("2.0.0-beta.1", "2.0.0"));
         assert!(!check_version_constraint("2.0.0", "2.0.0-beta.1"));
+    }
+
+    #[test]
+    fn check_version_constraint_treats_bare_literals_as_exact_matches() {
+        assert!(check_version_constraint("2.0.0", "2.0.0"));
+        assert!(!check_version_constraint("2.0.1", "2.0.0"));
+        assert!(check_version_constraint("2.0.0", "2.0"));
+        assert!(!check_version_constraint("2.0.1", "2.0"));
+        assert!(!check_version_constraint("1.0.0", "1"));
     }
 
     #[test]
@@ -31214,7 +31272,7 @@ mod tests {
                         allow: true,
                         decided_at: "2026-01-01T00:00:00Z".to_string(),
                         expires_at: None,
-                        version_range: Some(">=2.0.0 <3.0.0".to_string()),
+                        version_range: Some(">=2.0.0, <3.0.0".to_string()),
                     },
                 )]),
             );
@@ -31415,6 +31473,47 @@ mod tests {
             guard
                 .extension_versions
                 .insert("ext-1".to_string(), "2.0.0-beta.1".to_string());
+            guard.policy_prompt_cache.insert(
+                "ext-1".to_string(),
+                HashMap::from([(
+                    "exec".to_string(),
+                    PersistedDecision {
+                        capability: "exec".to_string(),
+                        allow: true,
+                        decided_at: "2026-01-01T00:00:00Z".to_string(),
+                        expires_at: None,
+                        version_range: Some("2.0.0".to_string()),
+                    },
+                )]),
+            );
+        }
+
+        assert_eq!(manager.cached_policy_prompt_decision("ext-1", "exec"), None);
+    }
+
+    #[test]
+    fn cached_policy_prompt_decision_rejects_exact_bare_version_mismatch() {
+        let manager = extension_manager_no_persisted_permissions();
+        {
+            let mut guard = manager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.extensions.push(RegisterPayload {
+                name: "ext-1".to_string(),
+                version: "2.0.1".to_string(),
+                api_version: "1.0.0".to_string(),
+                capabilities: Vec::new(),
+                capability_manifest: None,
+                tools: Vec::new(),
+                slash_commands: Vec::new(),
+                shortcuts: Vec::new(),
+                flags: Vec::new(),
+                event_hooks: Vec::new(),
+            });
+            guard
+                .extension_versions
+                .insert("ext-1".to_string(), "2.0.1".to_string());
             guard.policy_prompt_cache.insert(
                 "ext-1".to_string(),
                 HashMap::from([(
