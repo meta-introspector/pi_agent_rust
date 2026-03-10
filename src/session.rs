@@ -1726,7 +1726,8 @@ impl Session {
                         let new_entries = &self.entries[new_start..];
                         // Scale buffer reservation from observed on-disk average entry size to
                         // avoid repeated growth/copy when appending large entries.
-                        let estimated_entry_bytes = std::fs::metadata(&path_clone)
+                        let estimated_entry_bytes = asupersync::fs::metadata(&path_clone)
+                            .await
                             .ok()
                             .and_then(|meta| usize::try_from(meta.len()).ok())
                             .map_or(512, |file_bytes| {
