@@ -6,7 +6,7 @@
 use crate::compaction::{self, CompactionPreparation, CompactionResult};
 use crate::error::{Error, Result};
 use crate::provider::Provider;
-use asupersync::runtime::{JoinHandle, Runtime};
+use asupersync::runtime::{JoinHandle, RuntimeHandle};
 use futures::FutureExt;
 use futures::channel::oneshot;
 use std::sync::Arc;
@@ -116,21 +116,20 @@ impl CompactionWorkerState {
         Some(pending.join.await)
     }
 
-    /// Spawn a background compaction on the current runtime.
+    /// Spawn a background compaction on the provided runtime.
     pub fn start(
         &mut self,
+        runtime_handle: &RuntimeHandle,
         preparation: CompactionPreparation,
         provider: Arc<dyn Provider>,
         api_key: String,
         custom_instructions: Option<String>,
-    ) -> Result<()> {
+    ) {
         debug_assert!(
             self.can_start(),
             "start() called while can_start() is false"
         );
 
-        let runtime_handle = Runtime::current_handle()
-            .ok_or_else(|| Error::session("Background compaction requires an active runtime"))?;
         let (abort_tx, abort_rx) = oneshot::channel();
         let now = Instant::now();
         let join = runtime_handle.spawn(async move {
@@ -151,7 +150,6 @@ impl CompactionWorkerState {
         });
         self.last_start = Some(now);
         self.attempt_count = self.attempt_count.saturating_add(1);
-        Ok(())
     }
 }
 
@@ -209,11 +207,15 @@ mod tests {
         make_worker(CompactionQuota::default())
     }
 
-    fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
+    fn run_async<T, F>(make_future: impl FnOnce(RuntimeHandle) -> F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("build test runtime");
-        runtime.block_on(future)
+        let runtime_handle = runtime.handle();
+        runtime.block_on(make_future(runtime_handle))
     }
 
     fn inject_pending(worker: &mut CompactionWorkerState, pending: PendingCompaction) {
@@ -222,10 +224,11 @@ mod tests {
         worker.attempt_count += 1;
     }
 
-    async fn ready_pending(outcome: CompactionOutcome) -> PendingCompaction {
-        let join = Runtime::current_handle()
-            .expect("current runtime handle")
-            .spawn(async move { outcome });
+    async fn ready_pending_with_handle(
+        runtime_handle: RuntimeHandle,
+        outcome: CompactionOutcome,
+    ) -> PendingCompaction {
+        let join = runtime_handle.spawn(async move { outcome });
         PendingCompaction {
             join,
             abort_tx: None,
@@ -233,17 +236,18 @@ mod tests {
         }
     }
 
-    async fn parked_pending(aborted: Option<Arc<AtomicBool>>) -> PendingCompaction {
+    async fn parked_pending_with_handle(
+        runtime_handle: RuntimeHandle,
+        aborted: Option<Arc<AtomicBool>>,
+    ) -> PendingCompaction {
         let (abort_tx, abort_rx) = oneshot::channel();
-        let join = Runtime::current_handle()
-            .expect("current runtime handle")
-            .spawn(async move {
-                let _ = abort_rx.await;
-                if let Some(flag) = aborted {
-                    flag.store(true, Ordering::SeqCst);
-                }
-                Err(Error::session("Background compaction aborted".to_string()))
-            });
+        let join = runtime_handle.spawn(async move {
+            let _ = abort_rx.await;
+            if let Some(flag) = aborted {
+                flag.store(true, Ordering::SeqCst);
+            }
+            Err(Error::session("Background compaction aborted".to_string()))
+        });
         PendingCompaction {
             join,
             abort_tx: Some(abort_tx),
@@ -259,9 +263,9 @@ mod tests {
 
     #[test]
     fn cannot_start_while_pending() {
-        run_async(async {
+        run_async(|runtime_handle| async move {
             let mut w = default_worker();
-            let pending = parked_pending(None).await;
+            let pending = parked_pending_with_handle(runtime_handle, None).await;
             inject_pending(&mut w, pending);
             assert!(!w.can_start());
         });
@@ -306,7 +310,7 @@ mod tests {
 
     #[test]
     fn try_recv_none_when_no_pending() {
-        run_async(async {
+        run_async(|_runtime_handle| async move {
             let mut w = default_worker();
             assert!(w.try_recv().await.is_none());
         });
@@ -314,9 +318,9 @@ mod tests {
 
     #[test]
     fn try_recv_none_when_not_ready() {
-        run_async(async {
+        run_async(|runtime_handle| async move {
             let mut w = default_worker();
-            let pending = parked_pending(None).await;
+            let pending = parked_pending_with_handle(runtime_handle, None).await;
             inject_pending(&mut w, pending);
             // Nothing completed yet.
             assert!(w.try_recv().await.is_none());
@@ -327,10 +331,11 @@ mod tests {
 
     #[test]
     fn dropping_worker_aborts_pending_task() {
-        run_async(async {
+        run_async(|runtime_handle| async move {
             let aborted = Arc::new(AtomicBool::new(false));
             let mut w = default_worker();
-            let pending = parked_pending(Some(Arc::clone(&aborted))).await;
+            let pending =
+                parked_pending_with_handle(runtime_handle, Some(Arc::clone(&aborted))).await;
             inject_pending(&mut w, pending);
 
             drop(w);
@@ -345,13 +350,14 @@ mod tests {
 
     #[test]
     fn try_recv_timeout() {
-        run_async(async {
+        run_async(|runtime_handle| async move {
             let aborted = Arc::new(AtomicBool::new(false));
             let mut w = make_worker(CompactionQuota {
                 timeout: Duration::from_millis(0),
                 ..CompactionQuota::default()
             });
-            let mut pending = parked_pending(Some(Arc::clone(&aborted))).await;
+            let mut pending =
+                parked_pending_with_handle(runtime_handle, Some(Arc::clone(&aborted))).await;
             pending.started_at = Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now);
@@ -372,7 +378,7 @@ mod tests {
 
     #[test]
     fn try_recv_success() {
-        run_async(async {
+        run_async(|runtime_handle| async move {
             let mut w = default_worker();
 
             // Simulate a successful compaction result.
@@ -385,7 +391,7 @@ mod tests {
                     modified_files: vec![],
                 },
             };
-            let pending = ready_pending(Ok(result)).await;
+            let pending = ready_pending_with_handle(runtime_handle, Ok(result)).await;
             inject_pending(&mut w, pending);
             asupersync::runtime::yield_now().await;
 

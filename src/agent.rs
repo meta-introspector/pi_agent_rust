@@ -37,6 +37,7 @@ use crate::models::{ModelEntry, ModelRegistry, model_requires_configured_credent
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
 use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
+use asupersync::runtime::{Runtime, RuntimeBuilder, RuntimeHandle};
 use asupersync::sync::{Mutex, Notify};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -2141,6 +2142,8 @@ pub struct AgentSession {
     extensions_turn_active: Arc<AtomicBool>,
     extensions_pending_idle_actions: Arc<StdMutex<VecDeque<PendingIdleAction>>>,
     compaction_settings: ResolvedCompactionSettings,
+    compaction_runtime: Option<Runtime>,
+    runtime_handle: Option<RuntimeHandle>,
     compaction_worker: CompactionWorkerState,
     model_registry: Option<ModelRegistry>,
     auth_storage: Option<AuthStorage>,
@@ -5059,10 +5062,19 @@ impl AgentSession {
             extensions_turn_active: Arc::new(AtomicBool::new(false)),
             extensions_pending_idle_actions: Arc::new(StdMutex::new(VecDeque::new())),
             compaction_settings,
+            compaction_runtime: None,
+            runtime_handle: None,
             compaction_worker: CompactionWorkerState::new(CompactionQuota::default()),
             model_registry: None,
             auth_storage: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_runtime_handle(mut self, runtime_handle: RuntimeHandle) -> Self {
+        self.compaction_runtime = None;
+        self.runtime_handle = Some(runtime_handle);
+        self
     }
 
     #[must_use]
@@ -5437,17 +5449,38 @@ impl AgentSession {
                 .clone()
                 .unwrap_or_default();
 
-            if let Err(e) = self.compaction_worker.start(prep, provider, api_key, None) {
-                on_event(AgentEvent::AutoCompactionEnd {
-                    result: None,
-                    aborted: false,
-                    will_retry: false,
-                    error_message: Some(e.to_string()),
-                });
-            }
+            let runtime_handle = match self.compaction_runtime_handle() {
+                Ok(runtime_handle) => runtime_handle,
+                Err(e) => {
+                    on_event(AgentEvent::AutoCompactionEnd {
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: Some(e.to_string()),
+                    });
+                    return Ok(());
+                }
+            };
+
+            self.compaction_worker
+                .start(&runtime_handle, prep, provider, api_key, None);
         }
 
         Ok(())
+    }
+
+    fn compaction_runtime_handle(&mut self) -> Result<RuntimeHandle> {
+        if let Some(runtime_handle) = self.runtime_handle.clone() {
+            return Ok(runtime_handle);
+        }
+
+        let runtime = RuntimeBuilder::new().build().map_err(|e| {
+            Error::session(format!("Background compaction runtime init failed: {e}"))
+        })?;
+        let runtime_handle = runtime.handle();
+        self.compaction_runtime = Some(runtime);
+        self.runtime_handle = Some(runtime_handle.clone());
+        Ok(runtime_handle)
     }
 
     /// Apply a completed compaction result to the session.
@@ -6912,6 +6945,26 @@ mod tests {
         agent_session.set_model_registry(registry);
         agent_session.set_auth_storage(auth.clone());
         agent_session
+    }
+
+    #[test]
+    fn compaction_runtime_handle_creates_fallback_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        let auth = AuthStorage::load(auth_path).expect("load auth");
+        let mut agent_session = build_switch_test_session(&auth);
+
+        assert!(agent_session.compaction_runtime.is_none());
+        assert!(agent_session.runtime_handle.is_none());
+
+        let runtime_handle = agent_session
+            .compaction_runtime_handle()
+            .expect("create fallback compaction runtime");
+        let join = runtime_handle.spawn(async { 7_u8 });
+        assert_eq!(futures::executor::block_on(join), 7);
+
+        assert!(agent_session.compaction_runtime.is_some());
+        assert!(agent_session.runtime_handle.is_some());
     }
 
     #[test]

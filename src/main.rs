@@ -1229,7 +1229,8 @@ async fn run(
         session_arc,
         !cli.no_session,
         compaction_settings,
-    );
+    )
+    .with_runtime_handle(runtime_handle.clone());
     let mut extension_model_entries = Vec::new();
 
     if !resources.extensions().is_empty() {
