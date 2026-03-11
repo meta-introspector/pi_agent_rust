@@ -1,12 +1,15 @@
 //! Background compaction worker with basic quota controls.
 //!
 //! This keeps LLM compaction off the foreground turn path by running compaction
-//! on a dedicated thread and applying results on subsequent turns.
+//! on the existing runtime and applying results on subsequent turns.
 
 use crate::compaction::{self, CompactionPreparation, CompactionResult};
 use crate::error::{Error, Result};
 use crate::provider::Provider;
-use std::sync::{Arc, Mutex as StdMutex, mpsc};
+use asupersync::runtime::{JoinHandle, Runtime};
+use futures::FutureExt;
+use futures::channel::oneshot;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Quota controls that bound background compaction resource usage.
@@ -33,8 +36,21 @@ impl Default for CompactionQuota {
 type CompactionOutcome = Result<CompactionResult>;
 
 struct PendingCompaction {
-    rx: StdMutex<mpsc::Receiver<CompactionOutcome>>,
+    join: JoinHandle<CompactionOutcome>,
+    abort_tx: Option<oneshot::Sender<()>>,
     started_at: Instant,
+}
+
+impl PendingCompaction {
+    fn is_finished(&self) -> bool {
+        self.join.is_finished()
+    }
+
+    fn abort(&mut self) {
+        if let Some(abort_tx) = self.abort_tx.take() {
+            let _ = abort_tx.send(());
+        }
+    }
 }
 
 /// Per-session background compaction state.
@@ -72,7 +88,7 @@ impl CompactionWorkerState {
     }
 
     /// Non-blocking check for a completed compaction result.
-    pub fn try_recv(&mut self) -> Option<CompactionOutcome> {
+    pub async fn try_recv(&mut self) -> Option<CompactionOutcome> {
         // Check timeout first (read-only borrow, then drop before mutation).
         let timed_out = self
             .pending
@@ -80,96 +96,110 @@ impl CompactionWorkerState {
             .is_some_and(|p| p.started_at.elapsed() > self.quota.timeout);
 
         if timed_out {
-            self.pending = None;
+            if let Some(mut pending) = self.pending.take() {
+                pending.abort();
+            }
             return Some(Err(Error::session(
                 "Background compaction timed out".to_string(),
             )));
         }
 
-        // Try to receive — take() moves ownership so no outstanding borrow.
-        let pending = self.pending.take()?;
-        let recv_result = match pending.rx.lock() {
-            Ok(rx) => rx.try_recv(),
-            Err(_) => {
-                return Some(Err(Error::session(
-                    "Background compaction receiver mutex poisoned".to_string(),
-                )));
-            }
-        };
-
-        match recv_result {
-            Ok(outcome) => Some(outcome),
-            Err(mpsc::TryRecvError::Empty) => {
-                // Not done yet — put it back.
-                self.pending = Some(pending);
-                None
-            }
-            Err(mpsc::TryRecvError::Disconnected) => Some(Err(Error::session(
-                "Background compaction worker disconnected".to_string(),
-            ))),
+        if !self
+            .pending
+            .as_ref()
+            .is_some_and(PendingCompaction::is_finished)
+        {
+            return None;
         }
+
+        let pending = self.pending.take()?;
+        Some(pending.join.await)
     }
 
-    /// Spawn a background compaction in a dedicated thread.
+    /// Spawn a background compaction on the current runtime.
     pub fn start(
         &mut self,
         preparation: CompactionPreparation,
         provider: Arc<dyn Provider>,
         api_key: String,
         custom_instructions: Option<String>,
-    ) {
+    ) -> Result<()> {
         debug_assert!(
             self.can_start(),
             "start() called while can_start() is false"
         );
 
-        let (tx, rx) = mpsc::channel();
+        let runtime_handle = Runtime::current_handle()
+            .ok_or_else(|| Error::session("Background compaction requires an active runtime"))?;
+        let (abort_tx, abort_rx) = oneshot::channel();
         let now = Instant::now();
-
-        std::thread::Builder::new()
-            .name("pi-compaction-bg".to_string())
-            .spawn(move || {
-                run_compaction_thread(preparation, provider, api_key, custom_instructions, tx);
-            })
-            .expect("spawn background compaction thread");
+        let join = runtime_handle.spawn(async move {
+            run_compaction_task(
+                preparation,
+                provider,
+                api_key,
+                custom_instructions,
+                abort_rx,
+            )
+            .await
+        });
 
         self.pending = Some(PendingCompaction {
-            rx: StdMutex::new(rx),
+            join,
+            abort_tx: Some(abort_tx),
             started_at: now,
         });
         self.last_start = Some(now);
         self.attempt_count = self.attempt_count.saturating_add(1);
+        Ok(())
+    }
+}
+
+impl Drop for CompactionWorkerState {
+    fn drop(&mut self) {
+        if let Some(mut pending) = self.pending.take() {
+            pending.abort();
+        }
     }
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_compaction_thread(
+async fn run_compaction_task(
     preparation: CompactionPreparation,
     provider: Arc<dyn Provider>,
     api_key: String,
     custom_instructions: Option<String>,
-    tx: mpsc::Sender<CompactionOutcome>,
-) {
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime for background compaction");
+    abort_rx: oneshot::Receiver<()>,
+) -> CompactionOutcome {
+    let abort_fut = async move {
+        let _ = abort_rx.await;
+        Err(Error::session("Background compaction aborted".to_string()))
+    }
+    .fuse();
+    let compaction_fut = std::panic::AssertUnwindSafe(compaction::compact(
+        preparation,
+        provider,
+        &api_key,
+        custom_instructions.as_deref(),
+    ))
+    .catch_unwind()
+    .fuse();
 
-    let result = runtime.block_on(async {
-        compaction::compact(
-            preparation,
-            provider,
-            &api_key,
-            custom_instructions.as_deref(),
-        )
-        .await
-    });
+    futures::pin_mut!(abort_fut, compaction_fut);
 
-    let _ = tx.send(result);
+    match futures::future::select(abort_fut, compaction_fut).await {
+        futures::future::Either::Left((abort_result, _)) => abort_result,
+        futures::future::Either::Right((Ok(result), _)) => result,
+        futures::future::Either::Right((Err(_), _)) => Err(Error::session(
+            "Background compaction worker panicked".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn make_worker(quota: CompactionQuota) -> CompactionWorkerState {
         CompactionWorkerState::new(quota)
@@ -179,13 +209,46 @@ mod tests {
         make_worker(CompactionQuota::default())
     }
 
-    fn inject_pending(worker: &mut CompactionWorkerState, rx: mpsc::Receiver<CompactionOutcome>) {
-        worker.pending = Some(PendingCompaction {
-            rx: StdMutex::new(rx),
-            started_at: Instant::now(),
-        });
+    fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        runtime.block_on(future)
+    }
+
+    fn inject_pending(worker: &mut CompactionWorkerState, pending: PendingCompaction) {
+        worker.pending = Some(pending);
         worker.last_start = Some(Instant::now());
         worker.attempt_count += 1;
+    }
+
+    async fn ready_pending(outcome: CompactionOutcome) -> PendingCompaction {
+        let join = Runtime::current_handle()
+            .expect("current runtime handle")
+            .spawn(async move { outcome });
+        PendingCompaction {
+            join,
+            abort_tx: None,
+            started_at: Instant::now(),
+        }
+    }
+
+    async fn parked_pending(aborted: Option<Arc<AtomicBool>>) -> PendingCompaction {
+        let (abort_tx, abort_rx) = oneshot::channel();
+        let join = Runtime::current_handle()
+            .expect("current runtime handle")
+            .spawn(async move {
+                let _ = abort_rx.await;
+                if let Some(flag) = aborted {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                Err(Error::session("Background compaction aborted".to_string()))
+            });
+        PendingCompaction {
+            join,
+            abort_tx: Some(abort_tx),
+            started_at: Instant::now(),
+        }
     }
 
     #[test]
@@ -196,10 +259,12 @@ mod tests {
 
     #[test]
     fn cannot_start_while_pending() {
-        let mut w = default_worker();
-        let (_tx, rx) = mpsc::channel();
-        inject_pending(&mut w, rx);
-        assert!(!w.can_start());
+        run_async(async {
+            let mut w = default_worker();
+            let pending = parked_pending(None).await;
+            inject_pending(&mut w, pending);
+            assert!(!w.can_start());
+        });
     }
 
     #[test]
@@ -241,72 +306,93 @@ mod tests {
 
     #[test]
     fn try_recv_none_when_no_pending() {
-        let mut w = default_worker();
-        assert!(w.try_recv().is_none());
+        run_async(async {
+            let mut w = default_worker();
+            assert!(w.try_recv().await.is_none());
+        });
     }
 
     #[test]
     fn try_recv_none_when_not_ready() {
-        let mut w = default_worker();
-        let (_tx, rx) = mpsc::channel::<CompactionOutcome>();
-        inject_pending(&mut w, rx);
-        // Nothing sent yet.
-        assert!(w.try_recv().is_none());
-        // Pending should still be there.
-        assert!(w.pending.is_some());
+        run_async(async {
+            let mut w = default_worker();
+            let pending = parked_pending(None).await;
+            inject_pending(&mut w, pending);
+            // Nothing completed yet.
+            assert!(w.try_recv().await.is_none());
+            // Pending should still be there.
+            assert!(w.pending.is_some());
+        });
     }
 
     #[test]
-    fn try_recv_returns_disconnected_when_sender_dropped() {
-        let mut w = default_worker();
-        let (tx, rx) = mpsc::channel::<CompactionOutcome>();
-        inject_pending(&mut w, rx);
-        drop(tx);
-        let outcome = w.try_recv().expect("should return disconnected error");
-        assert!(outcome.is_err());
-        assert!(w.pending.is_none());
+    fn dropping_worker_aborts_pending_task() {
+        run_async(async {
+            let aborted = Arc::new(AtomicBool::new(false));
+            let mut w = default_worker();
+            let pending = parked_pending(Some(Arc::clone(&aborted))).await;
+            inject_pending(&mut w, pending);
+
+            drop(w);
+            asupersync::runtime::yield_now().await;
+
+            assert!(
+                aborted.load(Ordering::SeqCst),
+                "dropping the worker should abort the pending task"
+            );
+        });
     }
 
     #[test]
     fn try_recv_timeout() {
-        let mut w = make_worker(CompactionQuota {
-            timeout: Duration::from_millis(0),
-            ..CompactionQuota::default()
-        });
-        let (_tx, rx) = mpsc::channel::<CompactionOutcome>();
-        w.pending = Some(PendingCompaction {
-            rx: StdMutex::new(rx),
-            started_at: Instant::now()
+        run_async(async {
+            let aborted = Arc::new(AtomicBool::new(false));
+            let mut w = make_worker(CompactionQuota {
+                timeout: Duration::from_millis(0),
+                ..CompactionQuota::default()
+            });
+            let mut pending = parked_pending(Some(Arc::clone(&aborted))).await;
+            pending.started_at = Instant::now()
                 .checked_sub(Duration::from_secs(1))
-                .unwrap_or_else(Instant::now),
+                .unwrap_or_else(Instant::now);
+            inject_pending(&mut w, pending);
+
+            let outcome = w.try_recv().await.expect("should return timeout error");
+            assert!(outcome.is_err());
+            let err_msg = outcome.unwrap_err().to_string();
+            assert!(err_msg.contains("timed out"), "got: {err_msg}");
+
+            asupersync::runtime::yield_now().await;
+            assert!(
+                aborted.load(Ordering::SeqCst),
+                "timing out the worker should abort the pending task"
+            );
         });
-        let outcome = w.try_recv().expect("should return timeout error");
-        assert!(outcome.is_err());
-        let err_msg = outcome.unwrap_err().to_string();
-        assert!(err_msg.contains("timed out"), "got: {err_msg}");
     }
 
     #[test]
     fn try_recv_success() {
-        let mut w = default_worker();
-        let (tx, rx) = mpsc::channel::<CompactionOutcome>();
-        inject_pending(&mut w, rx);
+        run_async(async {
+            let mut w = default_worker();
 
-        // Simulate a successful compaction result.
-        let result = CompactionResult {
-            summary: "test summary".to_string(),
-            first_kept_entry_id: "entry-1".to_string(),
-            tokens_before: 1000,
-            details: compaction::CompactionDetails {
-                read_files: vec![],
-                modified_files: vec![],
-            },
-        };
-        tx.send(Ok(result)).unwrap();
+            // Simulate a successful compaction result.
+            let result = CompactionResult {
+                summary: "test summary".to_string(),
+                first_kept_entry_id: "entry-1".to_string(),
+                tokens_before: 1000,
+                details: compaction::CompactionDetails {
+                    read_files: vec![],
+                    modified_files: vec![],
+                },
+            };
+            let pending = ready_pending(Ok(result)).await;
+            inject_pending(&mut w, pending);
+            asupersync::runtime::yield_now().await;
 
-        let outcome = w.try_recv().expect("should have result");
-        let result = outcome.expect("should be Ok");
-        assert_eq!(result.summary, "test summary");
-        assert!(w.pending.is_none());
+            let outcome = w.try_recv().await.expect("should have result");
+            let result = outcome.expect("should be Ok");
+            assert_eq!(result.summary, "test summary");
+            assert!(w.pending.is_none());
+        });
     }
 }

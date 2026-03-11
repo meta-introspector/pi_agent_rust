@@ -5380,14 +5380,14 @@ impl AgentSession {
     ///
     /// **Phase 1** — apply a completed background compaction result (if any).
     /// **Phase 2** — if quotas allow and the session needs compaction, start a
-    /// new background compaction thread.
+    /// new background compaction task.
     async fn maybe_compact(&mut self, on_event: AgentEventHandler) -> Result<()> {
         if !self.compaction_settings.enabled {
             return Ok(());
         }
 
         // Phase 1: apply completed background result.
-        if let Some(outcome) = self.compaction_worker.try_recv() {
+        if let Some(outcome) = self.compaction_worker.try_recv().await {
             match outcome {
                 Ok(result) => {
                     self.apply_compaction_result(result, Arc::clone(&on_event))
@@ -5437,7 +5437,14 @@ impl AgentSession {
                 .clone()
                 .unwrap_or_default();
 
-            self.compaction_worker.start(prep, provider, api_key, None);
+            if let Err(e) = self.compaction_worker.start(prep, provider, api_key, None) {
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(e.to_string()),
+                });
+            }
         }
 
         Ok(())

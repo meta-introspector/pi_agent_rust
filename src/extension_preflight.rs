@@ -3320,6 +3320,45 @@ pi.exec("ls");
         }));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn analyze_unreadable_nested_directory_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let policy = ExtensionPolicy::default();
+        let analyzer = PreflightAnalyzer::new(&policy, None);
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let entry = temp_dir.path().join("clean.js");
+        std::fs::write(&entry, "export default function () {};\n").expect("write clean entry");
+
+        let blocked_dir = temp_dir.path().join("blocked");
+        std::fs::create_dir_all(&blocked_dir).expect("mkdir blocked dir");
+        std::fs::write(blocked_dir.join("hidden.js"), "import fs from 'fs';\n")
+            .expect("write blocked entry");
+        std::fs::set_permissions(&blocked_dir, PermissionsExt::from_mode(0o000))
+            .expect("chmod blocked dir");
+
+        let report = analyzer.analyze(temp_dir.path());
+
+        std::fs::set_permissions(&blocked_dir, PermissionsExt::from_mode(0o755))
+            .expect("restore blocked dir perms");
+
+        assert_eq!(
+            report.extension_id,
+            temp_dir
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("temp dir file name")
+        );
+        assert_eq!(report.verdict, PreflightVerdict::Fail);
+        assert!(report.findings.iter().any(|finding| {
+            finding.category == FindingCategory::AnalysisInput
+                && finding.message.contains("Failed to scan extension source")
+                && finding.message.contains(&blocked_dir.display().to_string())
+        }));
+    }
+
     #[test]
     fn analyze_uses_path_filename_when_extension_id_is_not_supplied() {
         let policy = ExtensionPolicy::default();
