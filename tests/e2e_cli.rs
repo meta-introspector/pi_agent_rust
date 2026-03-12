@@ -111,17 +111,17 @@ impl CliTestHarness {
 
     #[cfg(unix)]
     fn global_settings_path(&self) -> PathBuf {
-        self.env
-            .get("PI_CONFIG_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
+        self.env.get("PI_CONFIG_PATH").map_or_else(
+            || {
                 PathBuf::from(
                     self.env
                         .get("PI_CODING_AGENT_DIR")
                         .expect("PI_CODING_AGENT_DIR must be set"),
                 )
                 .join("settings.json")
-            })
+            },
+            PathBuf::from,
+        )
     }
 
     #[cfg(unix)]
@@ -1472,6 +1472,7 @@ fn e2e_cli_packages_install_list_remove_offline() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_cli_packages_update_respects_pinning_offline() {
     let mut harness = CliTestHarness::new("e2e_cli_packages_update_respects_pinning_offline");
     harness.env.remove("PI_CONFIG_PATH");

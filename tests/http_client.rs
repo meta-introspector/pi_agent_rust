@@ -218,7 +218,7 @@ fn response_204_without_content_length_returns_empty_body_without_waiting_for_cl
             .write_all(response.as_bytes())
             .expect("write response");
         stream.flush().expect("flush response");
-        thread::sleep(Duration::from_millis(1000));
+        thread::sleep(Duration::from_secs(1));
     });
 
     let url = server.url("/no-content");
@@ -283,7 +283,7 @@ fn invalid_content_length_is_error() {
             .write_all(response.as_bytes())
             .expect("write response");
         stream.flush().expect("flush response");
-        thread::sleep(Duration::from_millis(1000));
+        thread::sleep(Duration::from_secs(1));
     });
 
     let url = server.url("/invalid-content-length");

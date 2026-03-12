@@ -1012,6 +1012,14 @@ pub fn normalize_anthropic_base(base_url: &str) -> String {
     if trimmed.is_empty() {
         return "https://api.anthropic.com/v1/messages".to_string();
     }
+
+    if let Ok(url) = Url::parse(trimmed) {
+        if trimmed_url_path(&url).ends_with("/v1/messages") {
+            return canonicalize_url_path(&url);
+        }
+        return append_url_path(&url, "v1/messages");
+    }
+
     let base_url = trimmed.trim_end_matches('/');
     if base_url.ends_with("/v1/messages") {
         return base_url.to_string();
@@ -1019,17 +1027,50 @@ pub fn normalize_anthropic_base(base_url: &str) -> String {
     format!("{base_url}/v1/messages")
 }
 
-fn is_official_https_origin(base_url: &str, host: &str, default_port: u16) -> bool {
-    let Ok(url) = Url::parse(base_url) else {
-        return false;
-    };
+fn trimmed_url_path(url: &Url) -> &str {
+    match url.path().trim_end_matches('/') {
+        "" => "/",
+        trimmed => trimmed,
+    }
+}
 
+fn canonicalize_url_path(url: &Url) -> String {
+    let mut canonical = url.clone();
+    canonical.set_path(trimmed_url_path(url));
+    canonical.to_string()
+}
+
+fn replace_url_path(url: &Url, path: &str) -> String {
+    let mut updated = url.clone();
+    updated.set_path(path);
+    updated.to_string()
+}
+
+fn append_url_path(url: &Url, suffix: &str) -> String {
+    let base_path = trimmed_url_path(url);
+    let path = if base_path == "/" {
+        format!("/{suffix}")
+    } else {
+        format!("{base_path}/{suffix}")
+    };
+    replace_url_path(url, &path)
+}
+
+fn strip_url_path_suffix(url: &Url, suffix: &str) -> Option<Url> {
+    let base_path = trimmed_url_path(url);
+    let prefix = base_path.strip_suffix(suffix)?;
+    let mut stripped = url.clone();
+    stripped.set_path(if prefix.is_empty() { "/" } else { prefix });
+    Some(stripped)
+}
+
+fn is_official_https_origin(url: &Url, host: &str, default_port: u16) -> bool {
     url.scheme().eq_ignore_ascii_case("https")
         && url
             .host_str()
             .is_some_and(|candidate| candidate.eq_ignore_ascii_case(host))
         && url.port_or_known_default() == Some(default_port)
-        && matches!(url.path(), "" | "/")
+        && trimmed_url_path(url) == "/"
 }
 
 pub fn normalize_openai_base(base_url: &str) -> String {
@@ -1037,17 +1078,23 @@ pub fn normalize_openai_base(base_url: &str) -> String {
     if trimmed.is_empty() {
         return "https://api.openai.com/v1/chat/completions".to_string();
     }
+
+    if let Ok(url) = Url::parse(trimmed) {
+        if trimmed_url_path(&url).ends_with("/chat/completions") {
+            return canonicalize_url_path(&url);
+        }
+        let url = strip_url_path_suffix(&url, "/responses").unwrap_or(url);
+        if is_official_https_origin(&url, "api.openai.com", 443) {
+            return replace_url_path(&url, "/v1/chat/completions");
+        }
+        return append_url_path(&url, "chat/completions");
+    }
+
     let base_url = trimmed.trim_end_matches('/');
     if base_url.ends_with("/chat/completions") {
         return base_url.to_string();
     }
     let base_url = base_url.strip_suffix("/responses").unwrap_or(base_url);
-    if is_official_https_origin(base_url, "api.openai.com", 443) {
-        return "https://api.openai.com/v1/chat/completions".to_string();
-    }
-    if base_url.ends_with("/v1") {
-        return format!("{base_url}/chat/completions");
-    }
     format!("{base_url}/chat/completions")
 }
 
@@ -1056,6 +1103,18 @@ pub fn normalize_openai_responses_base(base_url: &str) -> String {
     if trimmed.is_empty() {
         return "https://api.openai.com/v1/responses".to_string();
     }
+
+    if let Ok(url) = Url::parse(trimmed) {
+        if trimmed_url_path(&url).ends_with("/responses") {
+            return canonicalize_url_path(&url);
+        }
+        let url = strip_url_path_suffix(&url, "/chat/completions").unwrap_or(url);
+        if is_official_https_origin(&url, "api.openai.com", 443) {
+            return replace_url_path(&url, "/v1/responses");
+        }
+        return append_url_path(&url, "responses");
+    }
+
     let base_url = trimmed.trim_end_matches('/');
     if base_url.ends_with("/responses") {
         return base_url.to_string();
@@ -1063,12 +1122,6 @@ pub fn normalize_openai_responses_base(base_url: &str) -> String {
     let base_url = base_url
         .strip_suffix("/chat/completions")
         .unwrap_or(base_url);
-    if is_official_https_origin(base_url, "api.openai.com", 443) {
-        return "https://api.openai.com/v1/responses".to_string();
-    }
-    if base_url.ends_with("/v1") {
-        return format!("{base_url}/responses");
-    }
     format!("{base_url}/responses")
 }
 
@@ -1077,6 +1130,18 @@ pub fn normalize_openai_codex_responses_base(base_url: &str) -> String {
     if trimmed.is_empty() {
         return openai_responses::CODEX_RESPONSES_API_URL.to_string();
     }
+
+    if let Ok(url) = Url::parse(trimmed) {
+        let path = trimmed_url_path(&url);
+        if path.ends_with("/backend-api/codex/responses") || path.ends_with("/responses") {
+            return canonicalize_url_path(&url);
+        }
+        if path.ends_with("/backend-api") {
+            return append_url_path(&url, "codex/responses");
+        }
+        return append_url_path(&url, "backend-api/codex/responses");
+    }
+
     let base = trimmed.trim_end_matches('/');
     if base.ends_with("/backend-api/codex/responses") {
         return base.to_string();
@@ -1098,15 +1163,20 @@ pub fn normalize_cohere_base(base_url: &str) -> String {
     if trimmed.is_empty() {
         return "https://api.cohere.com/v2/chat".to_string();
     }
-    let base_url = trimmed.trim_end_matches('/');
-    if is_official_https_origin(base_url, "api.cohere.com", 443) {
-        return "https://api.cohere.com/v2/chat".to_string();
+
+    if let Ok(url) = Url::parse(trimmed) {
+        if trimmed_url_path(&url).ends_with("/chat") {
+            return canonicalize_url_path(&url);
+        }
+        if is_official_https_origin(&url, "api.cohere.com", 443) {
+            return replace_url_path(&url, "/v2/chat");
+        }
+        return append_url_path(&url, "chat");
     }
+
+    let base_url = trimmed.trim_end_matches('/');
     if base_url.ends_with("/chat") {
         return base_url.to_string();
-    }
-    if base_url.ends_with("/v2") {
-        return format!("{base_url}/chat");
     }
     format!("{base_url}/chat")
 }
@@ -2185,6 +2255,14 @@ export default function init(pi) {
         );
     }
 
+    #[test]
+    fn normalize_anthropic_base_preserves_query_and_fragment() {
+        assert_eq!(
+            normalize_anthropic_base("https://api.anthropic.com/?via=proxy#frag"),
+            "https://api.anthropic.com/v1/messages?via=proxy#frag"
+        );
+    }
+
     // ── normalize_openai_base ───────────────────────────────────────
 
     #[test]
@@ -2248,6 +2326,14 @@ export default function init(pi) {
         assert_eq!(
             normalize_openai_base("https://my-llm-proxy.com"),
             "https://my-llm-proxy.com/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_base_preserves_query_and_fragment_on_official_origin() {
+        assert_eq!(
+            normalize_openai_base("https://api.openai.com:443/?via=proxy#frag"),
+            "https://api.openai.com/v1/chat/completions?via=proxy#frag"
         );
     }
 
@@ -2326,10 +2412,62 @@ export default function init(pi) {
     }
 
     #[test]
+    fn normalize_responses_preserves_query_and_fragment() {
+        assert_eq!(
+            normalize_openai_responses_base("https://my-llm-proxy.com/api?via=proxy#frag"),
+            "https://my-llm-proxy.com/api/responses?via=proxy#frag"
+        );
+    }
+
+    #[test]
+    fn normalize_responses_preserves_query_and_fragment_on_official_origin() {
+        assert_eq!(
+            normalize_openai_responses_base("https://api.openai.com:443/?via=proxy#frag"),
+            "https://api.openai.com/v1/responses?via=proxy#frag"
+        );
+    }
+
+    #[test]
     fn normalize_responses_base_empty_uses_default() {
         assert_eq!(
             normalize_openai_responses_base("  "),
             "https://api.openai.com/v1/responses"
+        );
+    }
+
+    // ── normalize_openai_codex_responses_base ──────────────────────
+
+    #[test]
+    fn normalize_codex_responses_base_empty_uses_default() {
+        assert_eq!(
+            normalize_openai_codex_responses_base(""),
+            openai_responses::CODEX_RESPONSES_API_URL
+        );
+    }
+
+    #[test]
+    fn normalize_codex_responses_base_keeps_existing_suffix() {
+        assert_eq!(
+            normalize_openai_codex_responses_base(
+                "https://chatgpt.com/backend-api/codex/responses"
+            ),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[test]
+    fn normalize_codex_responses_base_appends_suffix_from_backend_api() {
+        assert_eq!(
+            normalize_openai_codex_responses_base("https://chatgpt.com/backend-api"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[test]
+    fn normalize_codex_responses_base_preserves_query_and_fragment() {
+        assert_eq!(
+            normalize_openai_codex_responses_base("https://chatgpt.com/backend-api?via=proxy#frag"),
+            "https://chatgpt.com/backend-api/codex/responses?via=proxy#frag"
         );
     }
 
@@ -2380,6 +2518,22 @@ export default function init(pi) {
         assert_eq!(
             normalize_cohere_base("https://custom-cohere.example.com"),
             "https://custom-cohere.example.com/chat"
+        );
+    }
+
+    #[test]
+    fn normalize_cohere_preserves_query_and_fragment() {
+        assert_eq!(
+            normalize_cohere_base("https://custom-cohere.example.com/v2?tenant=test#frag"),
+            "https://custom-cohere.example.com/v2/chat?tenant=test#frag"
+        );
+    }
+
+    #[test]
+    fn normalize_cohere_preserves_query_and_fragment_on_official_origin() {
+        assert_eq!(
+            normalize_cohere_base("https://api.cohere.com:443/?tenant=test#frag"),
+            "https://api.cohere.com/v2/chat?tenant=test#frag"
         );
     }
 

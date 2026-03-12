@@ -1020,8 +1020,6 @@ Nested: **bold and *italic*** and ~~**strike bold**~~.
 
     // ── split_markdown_fenced_code_blocks edge cases ───────────────────
     #[test]
-    
-    #[test]
     fn split_markdown_tilde_code_blocks() {
         let input = "text1\n~~~rust\ncode1\n~~~\ntext2\n";
         let chunks = split_markdown_fenced_code_blocks(input);

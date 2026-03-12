@@ -181,6 +181,65 @@ fn enqueue_pi_event_preserves_extension_ui_requests_under_backpressure() {
 }
 
 #[test]
+fn enqueue_pi_event_preserves_conversation_reset_under_backpressure() {
+    asupersync::test_utils::run_test(|| async {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        event_tx
+            .try_send(PiMsg::System("busy".to_string()))
+            .expect("fill bounded event channel");
+
+        let send_cx = Cx::for_request();
+        let recv_cx = Cx::for_request();
+        let send_reset = enqueue_pi_event(
+            &event_tx,
+            &send_cx,
+            PiMsg::ConversationReset {
+                messages: Vec::new(),
+                usage: Usage::default(),
+                status: Some("Session resumed".to_string()),
+            },
+        );
+        let recv_messages = async {
+            let first = event_rx.recv(&recv_cx).await.expect("first queued message");
+            let second = event_rx
+                .recv(&recv_cx)
+                .await
+                .expect("conversation reset message");
+            (first, second)
+        };
+
+        let (enqueued, (first, second)) = futures::join!(send_reset, recv_messages);
+
+        assert!(
+            enqueued,
+            "conversation reset should enqueue once capacity opens"
+        );
+        assert!(matches!(first, PiMsg::System(text) if text == "busy"));
+        match second {
+            PiMsg::ConversationReset {
+                messages,
+                usage,
+                status,
+            } => {
+                assert!(messages.is_empty());
+                assert_eq!(usage.input, 0);
+                assert_eq!(usage.output, 0);
+                assert_eq!(usage.cache_read, 0);
+                assert_eq!(usage.cache_write, 0);
+                assert_eq!(usage.total_tokens, 0);
+                assert!(usage.cost.input.abs() <= f64::EPSILON);
+                assert!(usage.cost.output.abs() <= f64::EPSILON);
+                assert!(usage.cost.cache_read.abs() <= f64::EPSILON);
+                assert!(usage.cost.cache_write.abs() <= f64::EPSILON);
+                assert!(usage.cost.total.abs() <= f64::EPSILON);
+                assert_eq!(status.as_deref(), Some("Session resumed"));
+            }
+            other => panic!("expected conversation reset, got {other:?}"),
+        }
+    });
+}
+
+#[test]
 fn tmux_wheel_guard_extracts_saved_binding_command() {
     let line = r##"bind-key -T root WheelUpPane            if-shell -F "#{||:#{pane_in_mode},#{mouse_any_flag}}" { send-keys -M } { copy-mode -e }"##;
     assert_eq!(
