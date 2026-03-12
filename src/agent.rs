@@ -491,6 +491,13 @@ impl Agent {
         self.message_queue.set_modes(steering, follow_up);
     }
 
+    pub const fn queue_modes(&self) -> (QueueMode, QueueMode) {
+        (
+            self.message_queue.steering_mode,
+            self.message_queue.follow_up_mode,
+        )
+    }
+
     /// Count queued messages (steering + follow-up).
     #[must_use]
     pub fn queued_message_count(&self) -> usize {
@@ -2139,6 +2146,7 @@ pub struct AgentSession {
     /// down when the session ends.
     pub extensions: Option<ExtensionRegion>,
     extensions_is_streaming: Arc<AtomicBool>,
+    extensions_is_compacting: Arc<AtomicBool>,
     extensions_turn_active: Arc<AtomicBool>,
     extensions_pending_idle_actions: Arc<StdMutex<VecDeque<PendingIdleAction>>>,
     compaction_settings: ResolvedCompactionSettings,
@@ -3033,6 +3041,51 @@ mod extensions_integration_tests {
                 }),
                 "expected assistant response after triggered turn, got {messages:?}"
             );
+        });
+    }
+
+    #[test]
+    fn agent_extension_session_get_state_reports_agent_runtime_state() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let mut session = Session::in_memory();
+            session.set_model_header(
+                Some("test-provider".to_string()),
+                Some("test-model".to_string()),
+                Some("high".to_string()),
+            );
+            session.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Text("hello".to_string()),
+                timestamp: Some(1),
+            });
+            let session = Arc::new(Mutex::new(session));
+
+            let extension_session = AgentExtensionSession {
+                handle: SessionHandle(Arc::clone(&session)),
+                is_streaming: Arc::new(AtomicBool::new(true)),
+                is_compacting: Arc::new(AtomicBool::new(true)),
+                steering_mode: QueueMode::All,
+                follow_up_mode: QueueMode::OneAtATime,
+                auto_compaction_enabled: true,
+            };
+
+            let state = <AgentExtensionSession as crate::extensions::ExtensionSession>::get_state(
+                &extension_session,
+            )
+            .await;
+
+            assert_eq!(state["model"]["provider"], "test-provider");
+            assert_eq!(state["model"]["id"], "test-model");
+            assert_eq!(state["thinkingLevel"], "high");
+            assert_eq!(state["isStreaming"], true);
+            assert_eq!(state["isCompacting"], true);
+            assert_eq!(state["steeringMode"], "all");
+            assert_eq!(state["followUpMode"], "one-at-a-time");
+            assert_eq!(state["autoCompactionEnabled"], true);
+            assert_eq!(state["messageCount"], 1);
         });
     }
 
@@ -4985,6 +5038,168 @@ mod turn_event_tests {
     }
 }
 
+#[derive(Clone)]
+struct AgentExtensionSession {
+    handle: SessionHandle,
+    is_streaming: Arc<AtomicBool>,
+    is_compacting: Arc<AtomicBool>,
+    steering_mode: QueueMode,
+    follow_up_mode: QueueMode,
+    auto_compaction_enabled: bool,
+}
+
+impl AgentExtensionSession {
+    fn state_fallback(&self) -> Value {
+        json!({
+            "model": null,
+            "thinkingLevel": "off",
+            "durabilityMode": "balanced",
+            "isStreaming": self.is_streaming.load(std::sync::atomic::Ordering::SeqCst),
+            "isCompacting": self.is_compacting.load(std::sync::atomic::Ordering::SeqCst),
+            "steeringMode": self.steering_mode.as_str(),
+            "followUpMode": self.follow_up_mode.as_str(),
+            "sessionFile": null,
+            "sessionId": "",
+            "sessionName": null,
+            "autoCompactionEnabled": self.auto_compaction_enabled,
+            "messageCount": 0,
+            "pendingMessageCount": 0,
+        })
+    }
+}
+
+#[async_trait]
+impl crate::extensions::ExtensionSession for AgentExtensionSession {
+    async fn get_state(&self) -> Value {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let Ok(session) = self.handle.0.lock(cx.cx()).await else {
+            return self.state_fallback();
+        };
+
+        let session_file = session.path.as_ref().map(|p| p.display().to_string());
+        let session_id = session.header.id.clone();
+        let session_name = session.get_name();
+        let model = session
+            .header
+            .provider
+            .as_ref()
+            .zip(session.header.model_id.as_ref())
+            .map_or(Value::Null, |(provider, model_id)| {
+                json!({
+                    "provider": provider,
+                    "id": model_id,
+                })
+            });
+        let thinking_level = session
+            .header
+            .thinking_level
+            .clone()
+            .unwrap_or_else(|| "off".to_string());
+        let message_count = session
+            .entries_for_current_path()
+            .iter()
+            .filter(|entry| matches!(entry, crate::session::SessionEntry::Message(_)))
+            .count();
+        let pending_message_count = session.autosave_metrics().pending_mutations;
+        let durability_mode = session.autosave_durability_mode().as_str();
+
+        json!({
+            "model": model,
+            "thinkingLevel": thinking_level,
+            "durabilityMode": durability_mode,
+            "isStreaming": self.is_streaming.load(std::sync::atomic::Ordering::SeqCst),
+            "isCompacting": self.is_compacting.load(std::sync::atomic::Ordering::SeqCst),
+            "steeringMode": self.steering_mode.as_str(),
+            "followUpMode": self.follow_up_mode.as_str(),
+            "sessionFile": session_file,
+            "sessionId": session_id,
+            "sessionName": session_name,
+            "autoCompactionEnabled": self.auto_compaction_enabled,
+            "messageCount": message_count,
+            "pendingMessageCount": pending_message_count,
+        })
+    }
+
+    async fn get_messages(&self) -> Vec<crate::session::SessionMessage> {
+        <SessionHandle as crate::extensions::ExtensionSession>::get_messages(&self.handle).await
+    }
+
+    async fn get_entries(&self) -> Vec<Value> {
+        <SessionHandle as crate::extensions::ExtensionSession>::get_entries(&self.handle).await
+    }
+
+    async fn get_branch(&self) -> Vec<Value> {
+        <SessionHandle as crate::extensions::ExtensionSession>::get_branch(&self.handle).await
+    }
+
+    async fn set_name(&self, name: String) -> crate::error::Result<()> {
+        <SessionHandle as crate::extensions::ExtensionSession>::set_name(&self.handle, name).await
+    }
+
+    async fn append_message(
+        &self,
+        message: crate::session::SessionMessage,
+    ) -> crate::error::Result<()> {
+        <SessionHandle as crate::extensions::ExtensionSession>::append_message(
+            &self.handle,
+            message,
+        )
+        .await
+    }
+
+    async fn append_custom_entry(
+        &self,
+        custom_type: String,
+        data: Option<Value>,
+    ) -> crate::error::Result<()> {
+        <SessionHandle as crate::extensions::ExtensionSession>::append_custom_entry(
+            &self.handle,
+            custom_type,
+            data,
+        )
+        .await
+    }
+
+    async fn set_model(&self, provider: String, model_id: String) -> crate::error::Result<()> {
+        <SessionHandle as crate::extensions::ExtensionSession>::set_model(
+            &self.handle,
+            provider,
+            model_id,
+        )
+        .await
+    }
+
+    async fn get_model(&self) -> (Option<String>, Option<String>) {
+        <SessionHandle as crate::extensions::ExtensionSession>::get_model(&self.handle).await
+    }
+
+    async fn set_thinking_level(&self, level: String) -> crate::error::Result<()> {
+        <SessionHandle as crate::extensions::ExtensionSession>::set_thinking_level(
+            &self.handle,
+            level,
+        )
+        .await
+    }
+
+    async fn get_thinking_level(&self) -> Option<String> {
+        <SessionHandle as crate::extensions::ExtensionSession>::get_thinking_level(&self.handle)
+            .await
+    }
+
+    async fn set_label(
+        &self,
+        target_id: String,
+        label: Option<String>,
+    ) -> crate::error::Result<()> {
+        <SessionHandle as crate::extensions::ExtensionSession>::set_label(
+            &self.handle,
+            target_id,
+            label,
+        )
+        .await
+    }
+}
+
 impl AgentSession {
     pub const fn runtime_repair_mode_from_policy_mode(mode: RepairPolicyMode) -> RepairMode {
         match mode {
@@ -5059,6 +5274,7 @@ impl AgentSession {
             save_enabled,
             extensions: None,
             extensions_is_streaming: Arc::new(AtomicBool::new(false)),
+            extensions_is_compacting: Arc::new(AtomicBool::new(false)),
             extensions_turn_active: Arc::new(AtomicBool::new(false)),
             extensions_pending_idle_actions: Arc::new(StdMutex::new(VecDeque::new())),
             compaction_settings,
@@ -5400,6 +5616,8 @@ impl AgentSession {
 
         // Phase 1: apply completed background result.
         if let Some(outcome) = self.compaction_worker.try_recv().await {
+            self.extensions_is_compacting
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             match outcome {
                 Ok(result) => {
                     self.apply_compaction_result(result, Arc::clone(&on_event))
@@ -5464,6 +5682,8 @@ impl AgentSession {
 
             self.compaction_worker
                 .start(&runtime_handle, prep, provider, api_key, None);
+            self.extensions_is_compacting
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         Ok(())
@@ -5548,6 +5768,8 @@ impl AgentSession {
             on_event(AgentEvent::AutoCompactionStart {
                 reason: "threshold".to_string(),
             });
+            self.extensions_is_compacting
+                .store(true, std::sync::atomic::Ordering::SeqCst);
 
             let provider = self.agent.provider();
             let api_key = self // ubs:ignore
@@ -5557,7 +5779,11 @@ impl AgentSession {
                 .clone()
                 .unwrap_or_default();
 
-            match compaction::compact(prep, provider, &api_key, None).await {
+            let compaction_result = compaction::compact(prep, provider, &api_key, None).await;
+            self.extensions_is_compacting
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+
+            match compaction_result {
                 Ok(result) => {
                     self.apply_compaction_result(result, Arc::clone(&on_event))
                         .await?;
@@ -5769,7 +5995,15 @@ impl AgentSession {
         // Session, host actions, and message fetchers are always set here
         // (after runtime boot) — the JS runtime only needs these when
         // dispatching hostcalls, which happens during extension loading.
-        manager.set_session(Arc::new(SessionHandle(self.session.clone())));
+        let (steering_mode, follow_up_mode) = self.agent.queue_modes();
+        manager.set_session(Arc::new(AgentExtensionSession {
+            handle: SessionHandle(self.session.clone()),
+            is_streaming: Arc::clone(&self.extensions_is_streaming),
+            is_compacting: Arc::clone(&self.extensions_is_compacting),
+            steering_mode,
+            follow_up_mode,
+            auto_compaction_enabled: self.compaction_settings.enabled,
+        }));
 
         let injected = Arc::new(StdMutex::new(ExtensionInjectedQueue::default()));
         let host_actions = AgentSessionHostActions {

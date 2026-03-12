@@ -378,23 +378,31 @@ fn split_markdown_fenced_code_blocks(markdown: &str) -> Vec<MarkdownChunk> {
     let mut code_buf = String::new();
     let mut in_code_block = false;
     let mut fence_len = 0usize;
+    let mut fence_char = '\0';
     let mut code_language: Option<String> = None;
 
     for line in markdown.split_inclusive('\n') {
         let trimmed_start = line.trim_start();
         let trimmed_line = trimmed_start.trim_end_matches(['\r', '\n']);
 
-        let backtick_count = trimmed_line.chars().take_while(|ch| *ch == '`').count();
-        let is_fence = backtick_count >= 3 && trimmed_line.starts_with("```");
+        let marker = trimmed_line.chars().next().unwrap_or('\0');
+        let is_potential_fence = marker == '`' || marker == '~';
+        let marker_count = if is_potential_fence {
+            trimmed_line.chars().take_while(|ch| *ch == marker).count()
+        } else {
+            0
+        };
+        let is_fence = marker_count >= 3;
 
         if !in_code_block {
             if is_fence {
-                fence_len = backtick_count;
+                fence_len = marker_count;
+                fence_char = marker;
                 let info = trimmed_line.get(fence_len..).unwrap_or_default();
 
-                // CommonMark: The info string may not contain any backtick characters.
+                // CommonMark: backtick fence info strings may not contain backticks.
                 // If it does, this is likely an inline code span at the start of a line, not a fence.
-                if info.contains('`') {
+                if marker == '`' && info.contains('`') {
                     text_buf.push_str(line);
                     continue;
                 }
@@ -415,8 +423,9 @@ fn split_markdown_fenced_code_blocks(markdown: &str) -> Vec<MarkdownChunk> {
         }
 
         if is_fence
-            && backtick_count >= fence_len
-            && trimmed_line[backtick_count..].trim().is_empty()
+            && marker == fence_char
+            && marker_count >= fence_len
+            && trimmed_line[marker_count..].trim().is_empty()
         {
             chunks.push(MarkdownChunk::CodeBlock {
                 language: code_language.take(),
@@ -425,6 +434,7 @@ fn split_markdown_fenced_code_blocks(markdown: &str) -> Vec<MarkdownChunk> {
             code_buf.clear();
             in_code_block = false;
             fence_len = 0;
+            fence_char = '\0';
             continue;
         }
 
@@ -1009,6 +1019,20 @@ Nested: **bold and *italic*** and ~~**strike bold**~~.
     }
 
     // ── split_markdown_fenced_code_blocks edge cases ───────────────────
+    #[test]
+    
+    #[test]
+    fn split_markdown_tilde_code_blocks() {
+        let input = "text1\n~~~rust\ncode1\n~~~\ntext2\n";
+        let chunks = split_markdown_fenced_code_blocks(input);
+        assert_eq!(chunks.len(), 3, "expected 3 chunks: {chunks:?}");
+        assert!(matches!(&chunks[0], MarkdownChunk::Text(_)));
+        assert!(
+            matches!(&chunks[1], MarkdownChunk::CodeBlock { language, .. } if language.as_deref() == Some("rust"))
+        );
+        assert!(matches!(&chunks[2], MarkdownChunk::Text(_)));
+    }
+
     #[test]
     fn split_markdown_multiple_code_blocks() {
         let input = "text1\n```rust\ncode1\n```\ntext2\n```python\ncode2\n```\ntext3\n";

@@ -142,6 +142,10 @@ pub enum AuthCredential {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         service_url: Option<String>,
     },
+    /// Preserves malformed or legacy credential entries during migration/saving
+    /// so that we don't drop them if the schema evolves.
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
 }
 
 /// Canonical credential status for a provider in auth.json.
@@ -384,6 +388,7 @@ impl AuthStorage {
             AuthCredential::BearerToken { .. } => CredentialStatus::BearerToken,
             AuthCredential::AwsCredentials { .. } => CredentialStatus::AwsCredentials,
             AuthCredential::ServiceKey { .. } => CredentialStatus::ServiceKey,
+            AuthCredential::Unknown(_) => CredentialStatus::Missing,
         }
     }
 
@@ -807,7 +812,7 @@ fn api_key_from_credential(credential: &AuthCredential) -> Option<String> {
         }
         AuthCredential::BearerToken { token } => Some(token.clone()),
         AuthCredential::AwsCredentials { access_key_id, .. } => Some(access_key_id.clone()),
-        AuthCredential::ServiceKey { .. } => None,
+        AuthCredential::ServiceKey { .. } | AuthCredential::Unknown(_) => None,
     }
 }
 

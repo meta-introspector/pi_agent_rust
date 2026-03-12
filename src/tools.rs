@@ -4436,6 +4436,7 @@ impl BashOutputState {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Result<()> {
     if chunk.is_empty() {
         return Ok(());
