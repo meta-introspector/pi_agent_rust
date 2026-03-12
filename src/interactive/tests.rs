@@ -250,11 +250,13 @@ fn enqueue_pi_event_current_uses_ambient_context_under_backpressure() {
         let current_cx = Cx::for_testing();
         let _guard = Cx::set_current(Some(current_cx));
         let recv_cx = Cx::for_request();
-        let send_system =
-            enqueue_pi_event_current(&event_tx, PiMsg::System("queued".to_string()));
+        let send_system = enqueue_pi_event_current(&event_tx, PiMsg::System("queued".to_string()));
         let recv_messages = async {
             let first = event_rx.recv(&recv_cx).await.expect("first queued message");
-            let second = event_rx.recv(&recv_cx).await.expect("second queued message");
+            let second = event_rx
+                .recv(&recv_cx)
+                .await
+                .expect("second queued message");
             (first, second)
         };
 
@@ -272,7 +274,7 @@ fn enqueue_pi_event_current_respects_ambient_context_cancellation() {
         use asupersync::channel::mpsc::RecvError;
         use asupersync::types::CancelKind;
 
-        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (event_tx, event_rx) = mpsc::channel(1);
         event_tx
             .try_send(PiMsg::System("busy".to_string()))
             .expect("fill bounded event channel");
@@ -281,8 +283,12 @@ fn enqueue_pi_event_current_respects_ambient_context_cancellation() {
         current_cx.cancel_with(CancelKind::User, Some("cancel stale UI send"));
         let _guard = Cx::set_current(Some(current_cx));
 
-        let enqueued = enqueue_pi_event_current(&event_tx, PiMsg::System("stale".to_string())).await;
-        assert!(!enqueued, "cancelled ambient context must reject stale UI sends");
+        let enqueued =
+            enqueue_pi_event_current(&event_tx, PiMsg::System("stale".to_string())).await;
+        assert!(
+            !enqueued,
+            "cancelled ambient context must reject stale UI sends"
+        );
 
         let recv_cx = Cx::for_request();
         let first = event_rx.recv(&recv_cx).await.expect("first queued message");
