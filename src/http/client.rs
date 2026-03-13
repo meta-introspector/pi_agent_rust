@@ -601,13 +601,21 @@ async fn read_response_head(
 }
 
 fn find_headers_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    for i in 0..buf.len().saturating_sub(1) {
+        if buf[i..].starts_with(b"\r\n\r\n") {
+            return Some(i + 4);
+        }
+        if buf[i..].starts_with(b"\n\n") {
+            return Some(i + 2);
+        }
+    }
+    None
 }
 
 fn parse_response_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>)> {
     let text =
         std::str::from_utf8(head).map_err(|e| Error::api(format!("Invalid HTTP headers: {e}")))?;
-    let mut lines = text.split("\r\n");
+    let mut lines = text.lines();
 
     let status_line = lines
         .next()
@@ -836,11 +844,12 @@ impl BodyStreamState {
         Ok(Some(out))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn next_chunked(&mut self) -> std::io::Result<Option<Vec<u8>>> {
         loop {
             match self.chunked_state {
                 ChunkedState::SizeLine => {
-                    if let Some(line_end) = find_crlf(self.buf.available()) {
+                    if let Some((line_end, len)) = find_crlf(self.buf.available()) {
                         let line = &self.buf.available()[..line_end];
                         let line_str = std::str::from_utf8(line).map_err(std::io::Error::other)?;
                         let size_part = line_str.split(';').next().unwrap_or("").trim();
@@ -849,7 +858,7 @@ impl BodyStreamState {
                         }
                         let chunk_size = usize::from_str_radix(size_part, 16)
                             .map_err(|_| std::io::Error::other("invalid chunk size"))?;
-                        self.buf.consume(line_end + 2);
+                        self.buf.consume(line_end + len);
                         if chunk_size == 0 {
                             self.chunked_state = ChunkedState::Trailers;
                         } else {
@@ -896,21 +905,34 @@ impl BodyStreamState {
                 ChunkedState::DataCrlf => {
                     if self.buf.len() < 2 {
                         let n = Box::pin(self.read_more()).await?;
+                        if n == 0 && self.buf.is_empty() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "unexpected EOF reading chunk CRLF",
+                            ));
+                        }
+                        // Continue to let starts_with handle single byte \n or full \r\n
+                    }
+
+                    let bytes = self.buf.available();
+                    if bytes.starts_with(b"\r\n") {
+                        self.buf.consume(2);
+                        self.chunked_state = ChunkedState::SizeLine;
+                    } else if bytes.starts_with(b"\n") {
+                        self.buf.consume(1);
+                        self.chunked_state = ChunkedState::SizeLine;
+                    } else if bytes.len() >= 2 {
+                        return Err(std::io::Error::other("invalid chunk CRLF"));
+                    } else {
+                        // wait for more data
+                        let n = Box::pin(self.read_more()).await?;
                         if n == 0 {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::UnexpectedEof,
                                 "unexpected EOF reading chunk CRLF",
                             ));
                         }
-                        continue;
                     }
-
-                    let bytes = self.buf.available();
-                    if bytes[0] != b'\r' || bytes[1] != b'\n' {
-                        return Err(std::io::Error::other("invalid chunk CRLF"));
-                    }
-                    self.buf.consume(2);
-                    self.chunked_state = ChunkedState::SizeLine;
                 }
 
                 ChunkedState::Trailers => {
@@ -918,12 +940,17 @@ impl BodyStreamState {
                     // the terminator is a single CRLF (`0\r\n\r\n` total, with the final
                     // `\r\n` remaining after consuming the size line).
                     let bytes = self.buf.available();
-                    if bytes.len() >= 2 && bytes[0] == b'\r' && bytes[1] == b'\n' {
+                    if bytes.starts_with(b"\r\n") {
                         self.buf.consume(2);
                         self.chunked_state = ChunkedState::Done;
                         return Ok(None);
                     }
-                    if let Some(end) = find_double_crlf(self.buf.available()) {
+                    if bytes.starts_with(b"\n") {
+                        self.buf.consume(1);
+                        self.chunked_state = ChunkedState::Done;
+                        return Ok(None);
+                    }
+                    if let Some(end) = find_headers_end(self.buf.available()) {
                         self.buf.consume(end);
                         self.chunked_state = ChunkedState::Done;
                         return Ok(None);
@@ -944,12 +971,16 @@ impl BodyStreamState {
     }
 }
 
-fn find_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\r\n")
-}
-
-fn find_double_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+fn find_crlf(buf: &[u8]) -> Option<(usize, usize)> {
+    for i in 0..buf.len() {
+        if buf[i..].starts_with(b"\r\n") {
+            return Some((i, 2));
+        }
+        if buf[i..].starts_with(b"\n") {
+            return Some((i, 1));
+        }
+    }
+    None
 }
 
 async fn read_some<R: AsyncRead + Unpin>(reader: &mut R, dst: &mut [u8]) -> std::io::Result<usize> {
@@ -1056,7 +1087,12 @@ mod tests {
     // ── find_crlf ──────────────────────────────────────────────────────
     #[test]
     fn find_crlf_present() {
-        assert_eq!(find_crlf(b"abc\r\ndef"), Some(3));
+        assert_eq!(find_crlf(b"abc\r\ndef"), Some((3, 2)));
+    }
+
+    #[test]
+    fn find_crlf_present_lf() {
+        assert_eq!(find_crlf(b"abc\ndef"), Some((3, 1)));
     }
 
     #[test]
@@ -1066,19 +1102,12 @@ mod tests {
 
     #[test]
     fn find_crlf_at_start() {
-        assert_eq!(find_crlf(b"\r\ndata"), Some(0));
-    }
-
-    // ── find_double_crlf ───────────────────────────────────────────────
-    #[test]
-    fn find_double_crlf_present() {
-        let buf = b"headers\r\n\r\nbody";
-        assert_eq!(find_double_crlf(buf), Some(11));
+        assert_eq!(find_crlf(b"\r\ndata"), Some((0, 2)));
     }
 
     #[test]
-    fn find_double_crlf_absent() {
-        assert!(find_double_crlf(b"headers\r\nbody").is_none());
+    fn find_crlf_at_start_lf() {
+        assert_eq!(find_crlf(b"\ndata"), Some((0, 1)));
     }
 
     // ── parse_response_head ────────────────────────────────────────────
