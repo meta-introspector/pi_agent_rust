@@ -1171,8 +1171,7 @@ impl SessionStoreV2 {
                 }
                 last_observed_seq = frame.entry_seq;
 
-                let record_bytes = line.as_bytes().to_vec();
-                let crc = crc32c_upper(&record_bytes);
+                let crc = crc32c_upper(line.as_bytes());
 
                 let index_entry = OffsetIndexEntry {
                     schema: Cow::Borrowed(OFFSET_INDEX_SCHEMA),

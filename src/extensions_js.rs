@@ -9364,8 +9364,9 @@ const __pi_vfs = (() => {
     const normalized = String(encoding).toLowerCase();
     if (normalized === "base64") {
       let bin = "";
-      for (let i = 0; i < bytes.length; i++) {
-        bin += String.fromCharCode(bytes[i] & 0xff);
+      const CHUNK_SIZE = 8192;
+      for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK_SIZE));
       }
       return btoa(bin);
     }
