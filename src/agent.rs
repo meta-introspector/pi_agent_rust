@@ -2754,6 +2754,45 @@ mod extensions_integration_tests {
     }
 
     #[test]
+    fn agent_session_enable_extensions_with_no_entries_is_noop() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let provider = Arc::new(NoopProvider);
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[])
+                .await
+                .expect("empty extension list should be a no-op");
+
+            assert!(
+                agent_session.extensions.is_none(),
+                "no extension region should be created for an empty extension list"
+            );
+            assert!(
+                agent_session.agent.extensions.is_none(),
+                "agent should not report extensions active when nothing was requested"
+            );
+            assert!(
+                agent_session.extension_queue_modes.is_none(),
+                "empty extension list should not initialize queue mode mirrors"
+            );
+            assert!(
+                agent_session.extension_injected_queue.is_none(),
+                "empty extension list should not initialize injected extension queues"
+            );
+        });
+    }
+
+    #[test]
     fn agent_session_enable_extensions_rejects_mixed_js_and_native_entries() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -5991,6 +6030,16 @@ impl AgentSession {
                 "Mixed extension runtimes are not supported in one session yet. Use either JS/TS extensions (QuickJS) or native-rust descriptors (*.native.json), but not both at once."
                     .to_string(),
             ));
+        }
+
+        #[cfg(feature = "wasm-host")]
+        if js_specs.is_empty() && native_specs.is_empty() && wasm_specs.is_empty() {
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "wasm-host"))]
+        if js_specs.is_empty() && native_specs.is_empty() {
+            return Ok(());
         }
 
         let resolved_policy = Self::resolve_extension_policy_for_enable(config, policy);
