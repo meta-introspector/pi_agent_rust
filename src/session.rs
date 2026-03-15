@@ -957,7 +957,21 @@ impl Session {
 
         let scanned = scan_sessions_on_disk(&project_session_dir, entries.clone()).await?;
         let mut by_path: HashMap<PathBuf, SessionPickEntry> = HashMap::new();
-        for entry in entries.into_iter().chain(scanned.into_iter()) {
+        let index = SessionIndex::for_sessions_root(&base_dir);
+        for entry in entries {
+            by_path.insert(entry.path.clone(), entry);
+        }
+        for path in &scanned.failed_paths {
+            if let Err(err) = index.delete_session_path(path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "Failed to prune unreadable session from index during picker refresh"
+                );
+            }
+            by_path.remove(path);
+        }
+        for entry in scanned.entries {
             by_path
                 .entry(entry.path.clone())
                 .and_modify(|existing| {
@@ -1394,9 +1408,23 @@ impl Session {
                 .unwrap_or_default();
 
         let scanned = scan_sessions_on_disk(&project_session_dir, indexed_sessions.clone()).await?;
+        let index = SessionIndex::for_sessions_root(&base_dir);
 
         let mut by_path: HashMap<PathBuf, SessionPickEntry> = HashMap::new();
-        for entry in indexed_sessions.into_iter().chain(scanned.into_iter()) {
+        for entry in indexed_sessions {
+            by_path.insert(entry.path.clone(), entry);
+        }
+        for path in &scanned.failed_paths {
+            if let Err(err) = index.delete_session_path(path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "Failed to prune unreadable session from index during recent-session refresh"
+                );
+            }
+            by_path.remove(path);
+        }
+        for entry in scanned.entries {
             by_path
                 .entry(entry.path.clone())
                 .and_modify(|existing| {
@@ -2731,18 +2759,24 @@ const fn can_reuse_known_entry(
     known_entry.last_modified_ms == disk_ms && known_entry.size_bytes == disk_size
 }
 
+struct ScanSessionsResult {
+    entries: Vec<SessionPickEntry>,
+    failed_paths: Vec<PathBuf>,
+}
+
 async fn scan_sessions_on_disk(
     project_session_dir: &Path,
     known: Vec<SessionPickEntry>,
-) -> Result<Vec<SessionPickEntry>> {
+) -> Result<ScanSessionsResult> {
     let path_buf = project_session_dir.to_path_buf();
     let (tx, rx) = oneshot::channel();
 
     let handle = thread::Builder::new()
         .name("session-scan".to_string())
         .spawn(move || {
-            let res = (|| -> Result<Vec<SessionPickEntry>> {
+            let res = (|| -> Result<ScanSessionsResult> {
                 let mut entries = Vec::new();
+                let mut failed_paths = Vec::new();
                 let dir_entries = std::fs::read_dir(&path_buf)
                     .map_err(|e| Error::session(format!("Failed to read sessions: {e}")))?;
 
@@ -2765,12 +2799,16 @@ async fn scan_sessions_on_disk(
                             }
                         }
 
-                        if let Ok(meta) = load_session_meta(&path) {
-                            entries.push(meta);
+                        match load_session_meta(&path) {
+                            Ok(meta) => entries.push(meta),
+                            Err(_) => failed_paths.push(path),
                         }
                     }
                 }
-                Ok(entries)
+                Ok(ScanSessionsResult {
+                    entries,
+                    failed_paths,
+                })
             })();
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), res);
@@ -6979,10 +7017,98 @@ mod tests {
         let scanned =
             run_async(async { scan_sessions_on_disk(&session_dir, vec![stale_known_entry]).await })
                 .expect("scan sessions");
-        assert_eq!(scanned.len(), 1);
-        assert_eq!(scanned[0].path, path);
-        assert_eq!(scanned[0].message_count, 2);
-        assert_eq!(scanned[0].size_bytes, disk_size);
+        assert!(scanned.failed_paths.is_empty());
+        assert_eq!(scanned.entries.len(), 1);
+        assert_eq!(scanned.entries[0].path, path);
+        assert_eq!(scanned.entries[0].message_count, 2);
+        assert_eq!(scanned.entries[0].size_bytes, disk_size);
+    }
+
+    #[test]
+    fn test_scan_sessions_on_disk_reports_failed_paths_for_corrupt_changed_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.append_message(make_test_message("first"));
+        session.append_message(make_test_message("second"));
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().expect("session path");
+        let metadata = std::fs::metadata(&path).expect("session metadata");
+        let disk_size = metadata.len();
+        #[allow(clippy::cast_possible_truncation)]
+        let disk_ms = metadata
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let stale_known_entry = SessionPickEntry {
+            path: path.clone(),
+            id: session.header.id.clone(),
+            timestamp: session.header.timestamp.clone(),
+            message_count: 999,
+            name: Some("stale".to_string()),
+            last_modified_ms: disk_ms,
+            size_bytes: disk_size,
+        };
+
+        std::fs::write(&path, b"not valid jsonl\n").expect("corrupt session");
+
+        let session_dir = path.parent().expect("session parent").to_path_buf();
+        let scanned =
+            run_async(async { scan_sessions_on_disk(&session_dir, vec![stale_known_entry]).await })
+                .expect("scan sessions");
+
+        assert!(scanned.entries.is_empty());
+        assert_eq!(scanned.failed_paths, vec![path]);
+    }
+
+    #[test]
+    fn test_continue_recent_in_dir_prunes_corrupt_stale_index_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.append_message(make_test_message("first"));
+        session.append_message(make_test_message("second"));
+
+        run_async(async { session.save().await }).expect("save session");
+        let path = session.path.clone().expect("session path");
+
+        let index = SessionIndex::for_sessions_root(temp.path());
+        index.index_session(&session).expect("index session");
+        let cwd_display = std::env::current_dir()
+            .expect("current dir")
+            .display()
+            .to_string();
+        let has_indexed_path = index
+            .list_sessions(Some(&cwd_display))
+            .expect("list indexed sessions")
+            .into_iter()
+            .any(|meta| meta.path == path.display().to_string());
+        assert!(
+            has_indexed_path,
+            "expected indexed session before corruption"
+        );
+
+        std::fs::write(&path, b"not valid jsonl\n").expect("corrupt session");
+
+        let resumed = run_async(async {
+            Session::continue_recent_in_dir(Some(temp.path()), &Config::default()).await
+        })
+        .expect("continue recent");
+
+        assert!(resumed.path.is_none(), "expected a fresh unsaved session");
+        assert_eq!(resumed.session_dir, Some(temp.path().to_path_buf()));
+
+        let still_indexed = index
+            .list_sessions(Some(&cwd_display))
+            .expect("list indexed sessions after cleanup")
+            .into_iter()
+            .any(|meta| meta.path == path.display().to_string());
+        assert!(
+            !still_indexed,
+            "corrupt session should be pruned from the recent-session index"
+        );
     }
 
     #[test]
@@ -7059,11 +7185,12 @@ mod tests {
                 .expect("scan sessions");
         let (updated_ms, updated_size) = session_file_stats(&path).expect("updated stats");
 
-        assert_eq!(scanned.len(), 1);
-        assert_eq!(scanned[0].path, path);
-        assert_eq!(scanned[0].message_count, 1);
-        assert_eq!(scanned[0].size_bytes, updated_size);
-        assert_eq!(scanned[0].last_modified_ms, updated_ms);
+        assert!(scanned.failed_paths.is_empty());
+        assert_eq!(scanned.entries.len(), 1);
+        assert_eq!(scanned.entries[0].path, path);
+        assert_eq!(scanned.entries[0].message_count, 1);
+        assert_eq!(scanned.entries[0].size_bytes, updated_size);
+        assert_eq!(scanned.entries[0].last_modified_ms, updated_ms);
     }
 
     #[cfg(feature = "sqlite-sessions")]
