@@ -927,10 +927,7 @@ impl Session {
         let cwd = std::env::current_dir()?;
         let encoded_cwd = encode_cwd(&cwd);
         let project_session_dir = base_dir.join(&encoded_cwd);
-
-        if !project_session_dir.exists() {
-            return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
-        }
+        let project_session_dir_missing = indexed_session_path_is_missing(&project_session_dir);
 
         let base_dir_clone = base_dir.clone();
         let cwd_display = cwd.display().to_string();
@@ -957,6 +954,10 @@ impl Session {
                 path,
                 "Failed to prune missing session from index during picker refresh",
             );
+        }
+
+        if project_session_dir_missing {
+            return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
         }
 
         let scanned = scan_sessions_on_disk(&project_session_dir, entries.clone()).await?;
@@ -1372,10 +1373,7 @@ impl Session {
         let cwd_display = cwd.display().to_string();
         let encoded_cwd = encode_cwd(&cwd);
         let project_session_dir = base_dir.join(&encoded_cwd);
-
-        if !project_session_dir.exists() {
-            return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
-        }
+        let project_session_dir_missing = indexed_session_path_is_missing(&project_session_dir);
 
         // Prefer the session index for fast lookup.
         let base_dir_clone = base_dir.clone();
@@ -1412,6 +1410,11 @@ impl Session {
                 "Failed to prune missing session from index during recent-session refresh",
             );
         }
+
+        if project_session_dir_missing {
+            return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
+        }
+
         let scanned = scan_sessions_on_disk(&project_session_dir, indexed_sessions.clone()).await?;
 
         let mut by_path: HashMap<PathBuf, SessionPickEntry> = HashMap::new();
@@ -7202,6 +7205,44 @@ mod tests {
         assert!(
             !still_indexed,
             "missing session should be pruned from the recent-session index"
+        );
+    }
+
+    #[test]
+    fn test_continue_recent_in_dir_prunes_index_when_project_dir_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.append_message(make_test_message("first"));
+
+        run_async(async { session.save().await }).expect("save session");
+        let path = session.path.clone().expect("session path");
+
+        let index = SessionIndex::for_sessions_root(temp.path());
+        index.index_session(&session).expect("index session");
+        let cwd = std::env::current_dir().expect("current dir");
+        let cwd_display = cwd.display().to_string();
+        let project_session_dir = temp.path().join(encode_cwd(&cwd));
+        let moved_project_dir = temp.path().join("moved-project-dir");
+
+        std::fs::rename(&project_session_dir, &moved_project_dir)
+            .expect("move project session dir away");
+
+        let resumed = run_async(async {
+            Session::continue_recent_in_dir(Some(temp.path()), &Config::default()).await
+        })
+        .expect("continue recent");
+
+        assert!(resumed.path.is_none(), "expected a fresh unsaved session");
+        assert_eq!(resumed.session_dir, Some(temp.path().to_path_buf()));
+
+        let still_indexed = index
+            .list_sessions(Some(&cwd_display))
+            .expect("list indexed sessions after cleanup")
+            .into_iter()
+            .any(|meta| meta.path == path.display().to_string());
+        assert!(
+            !still_indexed,
+            "missing project dir should prune stale rows from the recent-session index"
         );
     }
 

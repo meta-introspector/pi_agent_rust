@@ -355,15 +355,12 @@ pub async fn pick_session(override_dir: Option<&Path>) -> Option<Session> {
 pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec<SessionMeta> {
     let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
     let project_session_dir = base_dir.join(encode_cwd(cwd));
-    if !project_session_dir.exists() {
-        return Vec::new();
-    }
-
     let cwd_key = cwd.display().to_string();
     let index = SessionIndex::for_sessions_root(&base_dir);
     let mut sessions = index.list_sessions(Some(&cwd_key)).unwrap_or_default();
+    let project_session_dir_missing = indexed_session_path_is_missing(&project_session_dir);
 
-    if sessions.is_empty() && index.reindex_all().is_ok() {
+    if !project_session_dir_missing && sessions.is_empty() && index.reindex_all().is_ok() {
         sessions = index.list_sessions(Some(&cwd_key)).unwrap_or_default();
     }
 
@@ -380,6 +377,10 @@ pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec
 
     for path in &missing_paths {
         let _ = index.delete_session_path(path);
+    }
+
+    if project_session_dir_missing {
+        return Vec::new();
     }
 
     let scanned = scan_sessions_on_disk(&project_session_dir, &by_path);
@@ -1377,6 +1378,43 @@ mod tests {
         let indexed = index
             .list_sessions(Some(&cwd.display().to_string()))
             .expect("list sessions");
+        assert!(indexed.is_empty());
+    }
+
+    #[test]
+    fn list_sessions_for_project_prunes_index_when_project_dir_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_dir = tmp.path().join("sessions");
+        let cwd = tmp.path().join("repo");
+        let project_dir = base_dir.join(encode_cwd(&cwd));
+        fs::create_dir_all(&project_dir).expect("create project sessions");
+
+        let session_path = project_dir.join("missing-project-dir.jsonl");
+        let mut header = SessionHeader::new();
+        header.id = "missing-project-dir".to_string();
+        header.cwd = cwd.display().to_string();
+        header.timestamp = "2025-06-01T12:00:00.000Z".to_string();
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n{{\"type\":\"message\"}}\n",
+                serde_json::to_string(&header).expect("serialize header"),
+            ),
+        )
+        .expect("write session");
+
+        let index = SessionIndex::for_sessions_root(&base_dir);
+        index.reindex_all().expect("seed session index");
+
+        let moved_project_dir = tmp.path().join("moved-project-dir");
+        fs::rename(&project_dir, &moved_project_dir).expect("move project dir away");
+
+        let sessions = list_sessions_for_project(&cwd, Some(&base_dir));
+        assert!(sessions.is_empty());
+
+        let indexed = index
+            .list_sessions(Some(&cwd.display().to_string()))
+            .expect("list indexed sessions");
         assert!(indexed.is_empty());
     }
 
