@@ -2803,13 +2803,15 @@ fn extract_package_source(value: &Value) -> Option<String> {
 
 fn persist_package_toggles(cwd: &Path, packages: &[ConfigPackageState]) -> Result<()> {
     let global_dir = Config::global_dir();
-    persist_package_toggles_with_roots(cwd, &global_dir, packages)
+    let config_override_path = Config::config_path_override_from_env(cwd);
+    persist_package_toggles_with_roots(cwd, &global_dir, config_override_path.as_deref(), packages)
 }
 
 #[allow(clippy::too_many_lines)]
 fn persist_package_toggles_with_roots(
     cwd: &Path,
     global_dir: &Path,
+    config_override_path: Option<&Path>,
     packages: &[ConfigPackageState],
 ) -> Result<()> {
     let mut updates_by_scope: std::collections::HashMap<
@@ -2847,18 +2849,34 @@ fn persist_package_toggles_with_roots(
             continue;
         }
 
+        // A full config override replaces the normal global/project split, so all
+        // package filter writes must land in the override file.
+        let scope = if config_override_path.is_some() {
+            SettingsScope::Global
+        } else {
+            package.scope
+        };
+
         updates_by_scope
-            .entry(package.scope)
+            .entry(scope)
             .or_default()
             .insert(package.source.clone(), state);
     }
 
-    for scope in [SettingsScope::Global, SettingsScope::Project] {
+    let scopes: &[SettingsScope] = if config_override_path.is_some() {
+        &[SettingsScope::Global]
+    } else {
+        &[SettingsScope::Global, SettingsScope::Project]
+    };
+
+    for &scope in scopes {
         let Some(scope_updates) = updates_by_scope.get(&scope) else {
             continue;
         };
 
-        let settings_path = Config::settings_path_with_roots(scope, global_dir, cwd);
+        let settings_path = config_override_path
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| Config::settings_path_with_roots(scope, global_dir, cwd));
         let mut settings = load_settings_json_object(&settings_path)?;
         if !settings.is_object() {
             settings = json!({});
@@ -2926,7 +2944,7 @@ fn persist_package_toggles_with_roots(
         }
 
         let patch = json!({ "packages": package_entries.clone() });
-        Config::patch_settings_with_roots(scope, global_dir, cwd, patch)?;
+        Config::patch_settings_to_path(&settings_path, patch)?;
     }
 
     Ok(())
@@ -5234,7 +5252,7 @@ mod tests {
             },
         ];
 
-        persist_package_toggles_with_roots(&cwd, &global_dir, &packages)
+        persist_package_toggles_with_roots(&cwd, &global_dir, None, &packages)
             .expect("persist package toggles");
 
         let global_value: serde_json::Value = serde_json::from_str(
@@ -5295,6 +5313,140 @@ mod tests {
                 .get("local")
                 .and_then(serde_json::Value::as_bool)
                 .expect("local")
+        );
+    }
+
+    #[test]
+    fn persist_package_toggles_with_config_override_updates_override_only() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path().join("repo");
+        let global_dir = temp.path().join("global");
+        let override_dir = temp.path().join("override");
+        let override_path = override_dir.join("settings.json");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&global_dir).expect("create global dir");
+        std::fs::create_dir_all(&override_dir).expect("create override dir");
+        std::fs::create_dir_all(cwd.join(".pi")).expect("create project .pi");
+
+        let global_original = serde_json::to_string_pretty(&json!({
+            "packages": ["npm:global-default"]
+        }))
+        .expect("serialize global settings");
+        std::fs::write(global_dir.join("settings.json"), &global_original)
+            .expect("write global settings");
+
+        let project_original = serde_json::to_string_pretty(&json!({
+            "packages": ["npm:project-default"]
+        }))
+        .expect("serialize project settings");
+        std::fs::write(cwd.join(".pi").join("settings.json"), &project_original)
+            .expect("write project settings");
+
+        std::fs::write(
+            &override_path,
+            serde_json::to_string_pretty(&json!({
+                "packages": [
+                    {
+                        "source": "npm:override",
+                        "kind": "npm",
+                        "extensions": ["extensions/old.js"]
+                    }
+                ]
+            }))
+            .expect("serialize override settings"),
+        )
+        .expect("write override settings");
+
+        let packages = vec![
+            ConfigPackageState {
+                scope: SettingsScope::Global,
+                source: "npm:override".to_string(),
+                resources: vec![
+                    ConfigResourceState {
+                        kind: ConfigResourceKind::Extensions,
+                        path: "extensions/new.js".to_string(),
+                        enabled: true,
+                    },
+                    ConfigResourceState {
+                        kind: ConfigResourceKind::Extensions,
+                        path: "extensions/disabled.js".to_string(),
+                        enabled: false,
+                    },
+                ],
+            },
+            // Defensive regression: a full config override uses one file, so mixed
+            // scope package states must still be persisted together into that file.
+            ConfigPackageState {
+                scope: SettingsScope::Project,
+                source: "npm:override-project".to_string(),
+                resources: vec![ConfigResourceState {
+                    kind: ConfigResourceKind::Skills,
+                    path: "skills/demo/SKILL.md".to_string(),
+                    enabled: true,
+                }],
+            },
+        ];
+
+        persist_package_toggles_with_roots(&cwd, &global_dir, Some(&override_path), &packages)
+            .expect("persist package toggles");
+
+        let override_value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&override_path).expect("read override"))
+                .expect("parse override json");
+        let override_packages = override_value["packages"]
+            .as_array()
+            .expect("override packages array");
+        assert_eq!(override_packages.len(), 2);
+
+        let override_pkg = override_packages[0]
+            .as_object()
+            .expect("override package object");
+        assert_eq!(
+            override_pkg
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .expect("source"),
+            "npm:override"
+        );
+        assert_eq!(
+            override_pkg
+                .get("extensions")
+                .and_then(serde_json::Value::as_array)
+                .expect("extensions")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["extensions/new.js"]
+        );
+
+        let override_project_pkg = override_packages[1]
+            .as_object()
+            .expect("override project package object");
+        assert_eq!(
+            override_project_pkg
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .expect("source"),
+            "npm:override-project"
+        );
+        assert_eq!(
+            override_project_pkg
+                .get("skills")
+                .and_then(serde_json::Value::as_array)
+                .expect("skills")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["skills/demo/SKILL.md"]
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(global_dir.join("settings.json")).expect("read global"),
+            global_original
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join(".pi").join("settings.json")).expect("read project"),
+            project_original
         );
     }
 

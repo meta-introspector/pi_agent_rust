@@ -450,6 +450,11 @@ impl Config {
         Ok(path)
     }
 
+    pub fn patch_settings_to_path(path: &Path, patch: Value) -> Result<PathBuf> {
+        patch_settings_file(path, patch)?;
+        Ok(path.to_path_buf())
+    }
+
     /// Merge two configurations, with `other` taking precedence.
     pub fn merge(base: Self, other: Self) -> Self {
         Self {
@@ -1564,6 +1569,22 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn patch_settings_to_path_updates_explicit_file() {
+        let temp = TempDir::new().expect("create tempdir");
+        let path = temp.path().join("override").join("settings.json");
+
+        let updated =
+            Config::patch_settings_to_path(&path, json!({ "default_provider": "anthropic" }))
+                .expect("patch settings");
+
+        assert_eq!(updated, path);
+
+        let stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        assert_eq!(stored["default_provider"], json!("anthropic"));
     }
 
     #[test]
