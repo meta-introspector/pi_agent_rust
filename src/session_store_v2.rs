@@ -1102,7 +1102,7 @@ impl SessionStoreV2 {
                 let frame: SegmentFrame = match serde_json::from_str(json_line) {
                     Ok(frame) => {
                         if missing_newline {
-                            use std::io::Write;
+                            use std::io::{Read, Write};
                             tracing::warn!(
                                 segment = %seg_path.display(),
                                 line_number,
@@ -1112,6 +1112,8 @@ impl SessionStoreV2 {
                             f.write_all(b"\n")?;
                             line.push('\n');
                             line_len += 1;
+                            // Consume the newline from the reader so it isn't double-counted
+                            let _ = reader.read_exact(&mut [0u8; 1]);
                         }
                         frame
                     }
