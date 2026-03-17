@@ -360,22 +360,20 @@ pub(crate) fn enqueue_session_index_snapshot_update(
     let sessions_root = sessions_root.to_path_buf();
     let path = path.to_path_buf();
     let header = header.clone();
-    
-    std::thread::spawn(move || {
-        if let Err(err) = SessionIndex::for_sessions_root(&sessions_root).index_session_snapshot(
-            &path,
-            &header,
-            message_count,
-            name,
-        ) {
-            tracing::warn!(
-                sessions_root = %sessions_root.display(),
-                path = %path.display(),
-                error = %err,
-                "Failed to update session index snapshot"
-            );
-        }
-    });
+
+    if let Err(err) = SessionIndex::for_sessions_root(&sessions_root).index_session_snapshot(
+        &path,
+        &header,
+        message_count,
+        name,
+    ) {
+        tracing::warn!(
+            sessions_root = %sessions_root.display(),
+            path = %path.display(),
+            error = %err,
+            "Failed to update session index snapshot"
+        );
+    }
 }
 
 fn init_schema(conn: &SqliteConnection) -> Result<()> {
@@ -1370,6 +1368,37 @@ mod tests {
             listed[0].last_modified_ms,
             i64::try_from(wal_millis).expect("wal mtime fits in i64")
         );
+    }
+
+    #[test]
+    fn enqueue_session_index_snapshot_update_persists_row_immediately() {
+        let harness =
+            TestHarness::new("enqueue_session_index_snapshot_update_persists_row_immediately");
+        let root = harness.temp_path("sessions");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+
+        let path = project_dir.join("session.jsonl");
+        fs::write(&path, b"{\"type\":\"header\"}\n").expect("write session file");
+
+        let header = make_header("queued-id", "queued-cwd");
+        enqueue_session_index_snapshot_update(
+            &root,
+            &path,
+            &header,
+            3,
+            Some("Queued Session".to_string()),
+        );
+
+        let index = SessionIndex::for_sessions_root(&root);
+        let listed = index
+            .list_sessions(Some("queued-cwd"))
+            .expect("list queued snapshot rows");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "queued-id");
+        assert_eq!(listed[0].path, path.display().to_string());
+        assert_eq!(listed[0].message_count, 3);
+        assert_eq!(listed[0].name.as_deref(), Some("Queued Session"));
     }
 
     #[test]

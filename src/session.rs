@@ -973,6 +973,11 @@ impl Session {
             );
             by_path.remove(path);
         }
+        refresh_session_index_entries(
+            &session_index,
+            &scanned.refreshed_entries,
+            "Failed to refresh session metadata in index during picker refresh",
+        );
         for entry in scanned.entries {
             by_path
                 .entry(entry.path.clone())
@@ -1429,6 +1434,11 @@ impl Session {
             );
             by_path.remove(path);
         }
+        refresh_session_index_entries(
+            &index,
+            &scanned.refreshed_entries,
+            "Failed to refresh session metadata in index during recent-session refresh",
+        );
         for entry in scanned.entries {
             by_path
                 .entry(entry.path.clone())
@@ -2736,6 +2746,7 @@ pub struct SiblingBranch {
 struct SessionPickEntry {
     path: PathBuf,
     id: String,
+    cwd: String,
     timestamp: String,
     message_count: u64,
     name: Option<String>,
@@ -2748,11 +2759,25 @@ impl SessionPickEntry {
         Self {
             path: PathBuf::from(meta.path),
             id: meta.id,
+            cwd: meta.cwd,
             timestamp: meta.timestamp,
             message_count: meta.message_count,
             name: meta.name,
             last_modified_ms: meta.last_modified_ms,
             size_bytes: meta.size_bytes,
+        }
+    }
+
+    fn to_meta(&self) -> crate::session_index::SessionMeta {
+        crate::session_index::SessionMeta {
+            path: self.path.display().to_string(),
+            id: self.id.clone(),
+            cwd: self.cwd.clone(),
+            timestamp: self.timestamp.clone(),
+            message_count: self.message_count,
+            last_modified_ms: self.last_modified_ms,
+            size_bytes: self.size_bytes,
+            name: self.name.clone(),
         }
     }
 }
@@ -2811,7 +2836,25 @@ const fn can_reuse_known_entry(
 
 struct ScanSessionsResult {
     entries: Vec<SessionPickEntry>,
+    refreshed_entries: Vec<SessionPickEntry>,
     failed_paths: Vec<PathBuf>,
+}
+
+fn refresh_session_index_entries(
+    index: &SessionIndex,
+    entries: &[SessionPickEntry],
+    reason: &'static str,
+) {
+    for entry in entries {
+        if let Err(err) = index.upsert_session_meta(entry.to_meta()) {
+            tracing::warn!(
+                path = %entry.path.display(),
+                error = %err,
+                reason,
+                "Failed to refresh session metadata in index"
+            );
+        }
+    }
 }
 
 async fn scan_sessions_on_disk(
@@ -2826,6 +2869,7 @@ async fn scan_sessions_on_disk(
         .spawn(move || {
             let res = (|| -> Result<ScanSessionsResult> {
                 let mut entries = Vec::new();
+                let mut refreshed_entries = Vec::new();
                 let mut failed_paths = Vec::new();
                 let dir_entries = std::fs::read_dir(&path_buf)
                     .map_err(|e| Error::session(format!("Failed to read sessions: {e}")))?;
@@ -2850,13 +2894,17 @@ async fn scan_sessions_on_disk(
                         }
 
                         match load_session_meta(&path) {
-                            Ok(meta) => entries.push(meta),
+                            Ok(meta) => {
+                                refreshed_entries.push(meta.clone());
+                                entries.push(meta);
+                            }
                             Err(_) => failed_paths.push(path),
                         }
                     }
                 }
                 Ok(ScanSessionsResult {
                     entries,
+                    refreshed_entries,
                     failed_paths,
                 })
             })();
@@ -2940,6 +2988,7 @@ fn load_session_meta_jsonl(path: &Path) -> Result<SessionPickEntry> {
     Ok(SessionPickEntry {
         path: path.to_path_buf(),
         id: header.id,
+        cwd: header.cwd,
         timestamp: header.timestamp,
         message_count,
         name,
@@ -2963,6 +3012,7 @@ fn load_session_meta_sqlite(path: &Path) -> Result<SessionPickEntry> {
     Ok(SessionPickEntry {
         path: path.to_path_buf(),
         id: header.id,
+        cwd: header.cwd,
         timestamp: header.timestamp,
         message_count: meta.message_count,
         name: meta.name,
@@ -7022,6 +7072,7 @@ mod tests {
         let known_entry = SessionPickEntry {
             path: PathBuf::from("session.jsonl"),
             id: "session-id".to_string(),
+            cwd: "/work".to_string(),
             timestamp: "2026-01-01T00:00:00.000Z".to_string(),
             message_count: 4,
             name: Some("cached".to_string()),
@@ -7056,6 +7107,7 @@ mod tests {
         let stale_known_entry = SessionPickEntry {
             path: path.clone(),
             id: session.header.id.clone(),
+            cwd: session.header.cwd.clone(),
             timestamp: session.header.timestamp.clone(),
             message_count: 999,
             name: Some("stale".to_string()),
@@ -7069,6 +7121,7 @@ mod tests {
                 .expect("scan sessions");
         assert!(scanned.failed_paths.is_empty());
         assert_eq!(scanned.entries.len(), 1);
+        assert_eq!(scanned.refreshed_entries.len(), 1);
         assert_eq!(scanned.entries[0].path, path);
         assert_eq!(scanned.entries[0].message_count, 2);
         assert_eq!(scanned.entries[0].size_bytes, disk_size);
@@ -7096,6 +7149,7 @@ mod tests {
         let stale_known_entry = SessionPickEntry {
             path: path.clone(),
             id: session.header.id.clone(),
+            cwd: session.header.cwd.clone(),
             timestamp: session.header.timestamp.clone(),
             message_count: 999,
             name: Some("stale".to_string()),
@@ -7111,6 +7165,7 @@ mod tests {
                 .expect("scan sessions");
 
         assert!(scanned.entries.is_empty());
+        assert!(scanned.refreshed_entries.is_empty());
         assert_eq!(scanned.failed_paths, vec![path]);
     }
 
@@ -7344,6 +7399,93 @@ mod tests {
     }
 
     #[test]
+    fn test_continue_recent_in_dir_refreshes_index_after_changed_disk_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.append_message(make_test_message("first"));
+
+        run_async(async { session.save().await }).expect("save session");
+        let path = session.path.clone().expect("session path");
+
+        let index = SessionIndex::for_sessions_root(temp.path());
+        index.index_session(&session).expect("index session");
+        let cwd_display = std::env::current_dir()
+            .expect("current dir")
+            .display()
+            .to_string();
+
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{{\"type\":\"message\"}}\n{{\"type\":\"message\"}}\n{{\"type\":\"session_info\",\"name\":\"Refreshed\"}}\n",
+                serde_json::to_string(&session.header).expect("serialize header"),
+            ),
+        )
+        .expect("rewrite session");
+
+        let resumed = run_async(async {
+            Session::continue_recent_in_dir(Some(temp.path()), &Config::default()).await
+        })
+        .expect("continue recent");
+
+        assert_eq!(resumed.path.as_ref(), Some(&path));
+
+        let indexed = index
+            .list_sessions(Some(&cwd_display))
+            .expect("list indexed sessions");
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].path, path.display().to_string());
+        assert_eq!(indexed[0].message_count, 2);
+        assert_eq!(indexed[0].name.as_deref(), Some("Refreshed"));
+    }
+
+    #[test]
+    fn test_resume_with_picker_refreshes_index_after_changed_disk_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.append_message(make_test_message("first"));
+
+        run_async(async { session.save().await }).expect("save session");
+        let path = session.path.clone().expect("session path");
+
+        let index = SessionIndex::for_sessions_root(temp.path());
+        index.index_session(&session).expect("index session");
+        let cwd_display = std::env::current_dir()
+            .expect("current dir")
+            .display()
+            .to_string();
+
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{{\"type\":\"message\"}}\n{{\"type\":\"message\"}}\n{{\"type\":\"session_info\",\"name\":\"Refreshed\"}}\n",
+                serde_json::to_string(&session.header).expect("serialize header"),
+            ),
+        )
+        .expect("rewrite session");
+
+        let resumed = run_async(async {
+            Session::resume_with_picker(
+                Some(temp.path()),
+                &Config::default(),
+                Some("1".to_string()),
+            )
+            .await
+        })
+        .expect("resume with picker");
+
+        assert_eq!(resumed.path.as_ref(), Some(&path));
+
+        let indexed = index
+            .list_sessions(Some(&cwd_display))
+            .expect("list indexed sessions");
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].path, path.display().to_string());
+        assert_eq!(indexed[0].message_count, 2);
+        assert_eq!(indexed[0].name.as_deref(), Some("Refreshed"));
+    }
+
+    #[test]
     fn test_load_session_meta_jsonl_errors_on_invalid_utf8_entry_line() {
         use std::io::Write;
 
@@ -7405,6 +7547,7 @@ mod tests {
         let stale_known_entry = SessionPickEntry {
             path: path.clone(),
             id: session.header.id.clone(),
+            cwd: session.header.cwd.clone(),
             timestamp: session.header.timestamp.clone(),
             message_count: 999,
             name: Some("stale".to_string()),
@@ -7419,6 +7562,7 @@ mod tests {
 
         assert!(scanned.failed_paths.is_empty());
         assert_eq!(scanned.entries.len(), 1);
+        assert_eq!(scanned.refreshed_entries.len(), 1);
         assert_eq!(scanned.entries[0].path, path);
         assert_eq!(scanned.entries[0].message_count, 1);
         assert_eq!(scanned.entries[0].size_bytes, updated_size);

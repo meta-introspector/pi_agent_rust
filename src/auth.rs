@@ -2,11 +2,9 @@
 //!
 //! Auth file: ~/.pi/agent/auth.json
 
-use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::provider_metadata::{canonical_provider_id, provider_auth_env_keys, provider_metadata};
-use asupersync::channel::oneshot;
 use base64::Engine as _;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
@@ -18,17 +16,6 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
-
-fn finish_auth_task<T, E>(
-    handle: std::thread::JoinHandle<()>,
-    recv_result: std::result::Result<Result<T>, E>,
-    cancelled_message: &'static str,
-) -> Result<T> {
-    if let Err(panic_payload) = handle.join() {
-        std::panic::resume_unwind(panic_payload);
-    }
-    recv_result.map_err(|_| Error::auth(cancelled_message.to_string()))?
-}
 
 const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_OAUTH_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
@@ -254,16 +241,7 @@ impl AuthStorage {
 
     /// Load auth.json asynchronously (creates empty if missing).
     pub async fn load_async(path: PathBuf) -> Result<Self> {
-        let (tx, rx) = oneshot::channel();
-        let handle = std::thread::spawn(move || {
-            let res = Self::load(path);
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
-        });
-
-        let cx = AgentCx::for_request();
-        let recv_result = rx.recv(cx.cx()).await;
-        finish_auth_task(handle, recv_result, "Load task cancelled")
+        asupersync::runtime::spawn_blocking(move || Self::load(path)).await
     }
 
     /// Persist auth.json (atomic write + permissions).
@@ -279,18 +257,9 @@ impl AuthStorage {
         let data = serde_json::to_string_pretty(&AuthFileRef {
             entries: &self.entries,
         })?;
-        let (tx, rx) = oneshot::channel();
         let path = self.path.clone();
 
-        let handle = std::thread::spawn(move || {
-            let res = Self::save_data_sync(&path, &data);
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
-        });
-
-        let cx = AgentCx::for_request();
-        let recv_result = rx.recv(cx.cx()).await;
-        finish_auth_task(handle, recv_result, "Save task cancelled")
+        asupersync::runtime::spawn_blocking(move || Self::save_data_sync(&path, &data)).await
     }
 
     fn save_data_sync(path: &Path, data: &str) -> Result<()> {
@@ -1713,11 +1682,14 @@ pub fn start_oauth_callback_server_random_port() -> Result<(OAuthCallbackServer,
         ))
     })?;
 
-    let port = listener.local_addr().map_err(|e| {
-        Error::auth(format!(
-            "Failed to get local address of OAuth callback listener: {e}"
-        ))
-    })?.port();
+    let port = listener
+        .local_addr()
+        .map_err(|e| {
+            Error::auth(format!(
+                "Failed to get local address of OAuth callback listener: {e}"
+            ))
+        })?
+        .port();
 
     let redirect_uri = format!("http://localhost:{port}/callback");
 
@@ -3753,42 +3725,50 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_auth_task_propagates_panic_before_cancellation() {
-        let handle = std::thread::spawn(|| -> () {
-            panic!("auth worker panic");
-        });
+    fn test_load_async_reads_existing_auth_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "openai": {
+    "type": "api_key",
+    "key": "sk-test"
+  }
+}"#,
+        )
+        .expect("write auth file");
 
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _: Result<()> = finish_auth_task(handle, Err(()), "Load task cancelled");
-        }));
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let storage = rt
+            .block_on(AuthStorage::load_async(path.clone()))
+            .expect("load async");
 
-        assert!(
-            panic.is_err(),
-            "worker panic should not be masked as cancellation"
-        );
+        assert_eq!(storage.path, path);
+        assert_eq!(storage.api_key("openai").as_deref(), Some("sk-test"));
     }
 
     #[test]
-    fn test_finish_auth_task_maps_nonpanic_cancellation_to_auth_error() {
-        let handle = std::thread::spawn(|| {});
-
-        let err =
-            finish_auth_task::<(), _>(handle, Err(()), "Load task cancelled").expect_err("error");
-
-        assert!(
-            err.to_string().contains("Load task cancelled"),
-            "unexpected error: {err}"
+    fn test_save_async_persists_auth_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("auth.json");
+        let mut storage = AuthStorage::load(path.clone()).expect("load empty auth storage");
+        storage.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "sk-ant".to_string(),
+            },
         );
-    }
 
-    #[test]
-    fn test_finish_auth_task_returns_success_payload() {
-        let handle = std::thread::spawn(|| {});
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(storage.save_async()).expect("save async");
 
-        let value =
-            finish_auth_task::<usize, ()>(handle, Ok(Ok(7usize)), "task cancelled").unwrap();
-
-        assert_eq!(value, 7);
+        let saved = AuthStorage::load(path).expect("reload auth storage");
+        assert_eq!(saved.api_key("anthropic").as_deref(), Some("sk-ant"));
     }
 
     #[allow(clippy::needless_pass_by_value)]
