@@ -7776,10 +7776,9 @@ fn tui_system_message_restores_tail_visibility_after_user_scrolls_up() {
     press_pgup(&harness, &mut app);
 
     let before = normalize_view(&BubbleteaModel::view(&app));
-    let pct_before = parse_scroll_percent(&before).expect("scroll indicator before system msg");
     assert!(
-        pct_before < 100,
-        "expected viewport to be away from bottom before system message, got {pct_before}%"
+        !before.contains("system line 200"),
+        "expected viewport to be away from the latest content before system message"
     );
 
     let marker = "SYSTEM-TAIL-MARKER-7f2f0c";
@@ -7791,11 +7790,7 @@ fn tui_system_message_restores_tail_visibility_after_user_scrolls_up() {
     );
 
     assert_after_contains(&harness, &step, marker);
-    let pct_after = parse_scroll_percent(&step.after).expect("scroll indicator after system msg");
-    assert_eq!(
-        pct_after, 100,
-        "system message should restore the viewport to the latest content"
-    );
+    assert_after_contains(&harness, &step, "system line 200");
 }
 
 // ============================================================================
