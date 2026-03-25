@@ -80,6 +80,126 @@ const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
 const KIMI_CODE_DEVICE_AUTHORIZATION_PATH: &str = "/api/oauth/device_authorization";
 const KIMI_CODE_TOKEN_PATH: &str = "/api/oauth/token";
 
+// ── OAuth env-var override helper ───────────────────────────────
+//
+// Every compiled-in OAuth constant can be overridden at runtime via an
+// environment variable.  This lets operators update credentials without
+// rebuilding the binary if a provider rotates client IDs or URLs.
+
+/// Read an OAuth parameter from the environment, falling back to the
+/// compiled-in default when the env var is absent or empty.
+fn oauth_param(env_key: &str, default: &str) -> String {
+    match std::env::var(env_key) {
+        Ok(val) if !val.is_empty() => {
+            tracing::debug!(env_key, "Using env override for OAuth parameter");
+            val
+        }
+        _ => default.to_string(),
+    }
+}
+
+// Accessor functions for each overridable OAuth constant.  Call these
+// instead of using the `const` values directly so the env-var escape
+// hatch is always active.
+
+fn anthropic_oauth_client_id() -> String {
+    oauth_param("PI_ANTHROPIC_OAUTH_CLIENT_ID", ANTHROPIC_OAUTH_CLIENT_ID)
+}
+fn anthropic_oauth_authorize_url() -> String {
+    oauth_param(
+        "PI_ANTHROPIC_OAUTH_AUTHORIZE_URL",
+        ANTHROPIC_OAUTH_AUTHORIZE_URL,
+    )
+}
+fn anthropic_oauth_token_url() -> String {
+    oauth_param("PI_ANTHROPIC_OAUTH_TOKEN_URL", ANTHROPIC_OAUTH_TOKEN_URL)
+}
+fn anthropic_oauth_redirect_uri() -> String {
+    oauth_param(
+        "PI_ANTHROPIC_OAUTH_REDIRECT_URI",
+        ANTHROPIC_OAUTH_REDIRECT_URI,
+    )
+}
+fn anthropic_oauth_scopes() -> String {
+    oauth_param("PI_ANTHROPIC_OAUTH_SCOPES", ANTHROPIC_OAUTH_SCOPES)
+}
+
+fn openai_codex_oauth_client_id() -> String {
+    oauth_param(
+        "PI_OPENAI_CODEX_OAUTH_CLIENT_ID",
+        OPENAI_CODEX_OAUTH_CLIENT_ID,
+    )
+}
+fn openai_codex_oauth_authorize_url() -> String {
+    oauth_param(
+        "PI_OPENAI_CODEX_OAUTH_AUTHORIZE_URL",
+        OPENAI_CODEX_OAUTH_AUTHORIZE_URL,
+    )
+}
+fn openai_codex_oauth_token_url() -> String {
+    oauth_param(
+        "PI_OPENAI_CODEX_OAUTH_TOKEN_URL",
+        OPENAI_CODEX_OAUTH_TOKEN_URL,
+    )
+}
+fn openai_codex_oauth_redirect_uri() -> String {
+    oauth_param(
+        "PI_OPENAI_CODEX_OAUTH_REDIRECT_URI",
+        OPENAI_CODEX_OAUTH_REDIRECT_URI,
+    )
+}
+fn openai_codex_oauth_scopes() -> String {
+    oauth_param("PI_OPENAI_CODEX_OAUTH_SCOPES", OPENAI_CODEX_OAUTH_SCOPES)
+}
+
+fn google_gemini_cli_oauth_client_id() -> String {
+    oauth_param(
+        "PI_GOOGLE_GEMINI_CLI_OAUTH_CLIENT_ID",
+        GOOGLE_GEMINI_CLI_OAUTH_CLIENT_ID,
+    )
+}
+fn google_gemini_cli_oauth_client_secret() -> String {
+    oauth_param(
+        "PI_GOOGLE_GEMINI_CLI_OAUTH_CLIENT_SECRET",
+        GOOGLE_GEMINI_CLI_OAUTH_CLIENT_SECRET,
+    )
+}
+fn google_gemini_cli_oauth_redirect_uri() -> String {
+    oauth_param(
+        "PI_GOOGLE_GEMINI_CLI_OAUTH_REDIRECT_URI",
+        GOOGLE_GEMINI_CLI_OAUTH_REDIRECT_URI,
+    )
+}
+
+fn google_antigravity_oauth_client_id() -> String {
+    oauth_param(
+        "PI_GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_ID",
+        GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_ID,
+    )
+}
+fn google_antigravity_oauth_client_secret() -> String {
+    oauth_param(
+        "PI_GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_SECRET",
+        GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_SECRET,
+    )
+}
+fn google_antigravity_oauth_redirect_uri() -> String {
+    oauth_param(
+        "PI_GOOGLE_ANTIGRAVITY_OAUTH_REDIRECT_URI",
+        GOOGLE_ANTIGRAVITY_OAUTH_REDIRECT_URI,
+    )
+}
+fn google_antigravity_default_project_id() -> String {
+    oauth_param(
+        "PI_GOOGLE_ANTIGRAVITY_PROJECT_ID",
+        GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID,
+    )
+}
+
+fn kimi_code_oauth_client_id() -> String {
+    oauth_param("PI_KIMI_CODE_OAUTH_CLIENT_ID", KIMI_CODE_OAUTH_CLIENT_ID)
+}
+
 /// Credentials stored in auth.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -875,7 +995,7 @@ fn resolve_external_provider_api_key(provider: &str) -> Option<String> {
         }
         "google-antigravity" => {
             let project = google_project_id_from_env()
-                .unwrap_or_else(|| GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string());
+                .unwrap_or_else(google_antigravity_default_project_id);
             read_external_gemini_access_payload(Some(project.as_str()))
         }
         "kimi-for-coding" => read_external_kimi_code_access_token(),
@@ -906,7 +1026,7 @@ pub fn external_setup_source(provider: &str) -> Option<&'static str> {
         }
         "google-antigravity" => {
             let project = google_project_id_from_env()
-                .unwrap_or_else(|| GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string());
+                .unwrap_or_else(google_antigravity_default_project_id);
             if read_external_gemini_access_payload(Some(project.as_str())).is_some() {
                 Some("Gemini CLI (~/.gemini/oauth_creds.json)")
             } else {
@@ -2194,14 +2314,18 @@ fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
 pub fn start_anthropic_oauth() -> Result<OAuthStartInfo> {
     let (verifier, challenge) = generate_pkce();
 
+    let client_id = anthropic_oauth_client_id();
+    let authorize_url = anthropic_oauth_authorize_url();
+    let redirect_uri = anthropic_oauth_redirect_uri();
+    let scopes = anthropic_oauth_scopes();
     let url = build_url_with_query(
-        ANTHROPIC_OAUTH_AUTHORIZE_URL,
+        &authorize_url,
         &[
             ("code", "true"),
-            ("client_id", ANTHROPIC_OAUTH_CLIENT_ID),
+            ("client_id", &client_id),
             ("response_type", "code"),
-            ("redirect_uri", ANTHROPIC_OAUTH_REDIRECT_URI),
-            ("scope", ANTHROPIC_OAUTH_SCOPES),
+            ("redirect_uri", &redirect_uri),
+            ("scope", &scopes),
             ("code_challenge", &challenge),
             ("code_challenge_method", "S256"),
             ("state", &verifier),
@@ -2216,7 +2340,7 @@ pub fn start_anthropic_oauth() -> Result<OAuthStartInfo> {
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
-        redirect_uri: Some(ANTHROPIC_OAUTH_REDIRECT_URI.to_string()),
+        redirect_uri: Some(redirect_uri),
         callback_server: None,
     })
 }
@@ -2234,15 +2358,19 @@ pub async fn complete_anthropic_oauth(code_input: &str, verifier: &str) -> Resul
         return Err(Error::auth("State mismatch".to_string()));
     }
 
+    let client_id = anthropic_oauth_client_id();
+    let token_url = anthropic_oauth_token_url();
+    let redirect_uri = anthropic_oauth_redirect_uri();
+
     let client = crate::http::client::Client::new();
     let request = client
-        .post(ANTHROPIC_OAUTH_TOKEN_URL)
+        .post(&token_url)
         .json(&serde_json::json!({
             "grant_type": "authorization_code",
-            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "client_id": client_id,
             "code": code,
             "state": state,
-            "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
+            "redirect_uri": redirect_uri,
             "code_verifier": verifier,
         }))?;
 
@@ -2270,8 +2398,8 @@ pub async fn complete_anthropic_oauth(code_input: &str, verifier: &str) -> Resul
         access_token: oauth_response.access_token,
         refresh_token: oauth_response.refresh_token,
         expires: oauth_expires_at_ms(oauth_response.expires_in),
-        token_url: Some(ANTHROPIC_OAUTH_TOKEN_URL.to_string()),
-        client_id: Some(ANTHROPIC_OAUTH_CLIENT_ID.to_string()),
+        token_url: Some(token_url),
+        client_id: Some(client_id),
     })
 }
 
@@ -2279,11 +2407,14 @@ async fn refresh_anthropic_oauth_token(
     client: &crate::http::client::Client,
     refresh_token: &str,
 ) -> Result<AuthCredential> {
+    let client_id = anthropic_oauth_client_id();
+    let token_url = anthropic_oauth_token_url();
+
     let request = client
-        .post(ANTHROPIC_OAUTH_TOKEN_URL)
+        .post(&token_url)
         .json(&serde_json::json!({
             "grant_type": "refresh_token",
-            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "client_id": client_id,
             "refresh_token": refresh_token,
         }))?;
 
@@ -2311,21 +2442,25 @@ async fn refresh_anthropic_oauth_token(
         access_token: oauth_response.access_token,
         refresh_token: oauth_response.refresh_token,
         expires: oauth_expires_at_ms(oauth_response.expires_in),
-        token_url: Some(ANTHROPIC_OAUTH_TOKEN_URL.to_string()),
-        client_id: Some(ANTHROPIC_OAUTH_CLIENT_ID.to_string()),
+        token_url: Some(token_url),
+        client_id: Some(client_id),
     })
 }
 
 /// Start OpenAI Codex OAuth by generating an authorization URL and PKCE verifier.
 pub fn start_openai_codex_oauth() -> Result<OAuthStartInfo> {
     let (verifier, challenge) = generate_pkce();
+    let client_id = openai_codex_oauth_client_id();
+    let authorize_url = openai_codex_oauth_authorize_url();
+    let redirect_uri = openai_codex_oauth_redirect_uri();
+    let scopes = openai_codex_oauth_scopes();
     let url = build_url_with_query(
-        OPENAI_CODEX_OAUTH_AUTHORIZE_URL,
+        &authorize_url,
         &[
             ("response_type", "code"),
-            ("client_id", OPENAI_CODEX_OAUTH_CLIENT_ID),
-            ("redirect_uri", OPENAI_CODEX_OAUTH_REDIRECT_URI),
-            ("scope", OPENAI_CODEX_OAUTH_SCOPES),
+            ("client_id", &client_id),
+            ("redirect_uri", &redirect_uri),
+            ("scope", &scopes),
             ("code_challenge", &challenge),
             ("code_challenge_method", "S256"),
             ("state", &verifier),
@@ -2343,7 +2478,7 @@ pub fn start_openai_codex_oauth() -> Result<OAuthStartInfo> {
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
-        redirect_uri: Some(OPENAI_CODEX_OAUTH_REDIRECT_URI.to_string()),
+        redirect_uri: Some(redirect_uri),
         callback_server: None,
     })
 }
@@ -2362,17 +2497,21 @@ pub async fn complete_openai_codex_oauth(
         return Err(Error::auth("State mismatch".to_string()));
     }
 
+    let client_id = openai_codex_oauth_client_id();
+    let token_url = openai_codex_oauth_token_url();
+    let redirect_uri = openai_codex_oauth_redirect_uri();
+
     let form_body = format!(
         "grant_type=authorization_code&client_id={}&code={}&code_verifier={}&redirect_uri={}",
-        percent_encode_component(OPENAI_CODEX_OAUTH_CLIENT_ID),
+        percent_encode_component(&client_id),
         percent_encode_component(&code),
         percent_encode_component(verifier),
-        percent_encode_component(OPENAI_CODEX_OAUTH_REDIRECT_URI),
+        percent_encode_component(&redirect_uri),
     );
 
     let client = crate::http::client::Client::new();
     let request = client
-        .post(OPENAI_CODEX_OAUTH_TOKEN_URL)
+        .post(&token_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .body(form_body.into_bytes());
@@ -2400,20 +2539,22 @@ pub async fn complete_openai_codex_oauth(
         access_token: oauth_response.access_token,
         refresh_token: oauth_response.refresh_token,
         expires: oauth_expires_at_ms(oauth_response.expires_in),
-        token_url: Some(OPENAI_CODEX_OAUTH_TOKEN_URL.to_string()),
-        client_id: Some(OPENAI_CODEX_OAUTH_CLIENT_ID.to_string()),
+        token_url: Some(token_url),
+        client_id: Some(client_id),
     })
 }
 
 /// Start Google Gemini CLI OAuth by generating an authorization URL and PKCE verifier.
 pub fn start_google_gemini_cli_oauth() -> Result<OAuthStartInfo> {
     let (verifier, challenge) = generate_pkce();
+    let client_id = google_gemini_cli_oauth_client_id();
+    let redirect_uri = google_gemini_cli_oauth_redirect_uri();
     let url = build_url_with_query(
         GOOGLE_GEMINI_CLI_OAUTH_AUTHORIZE_URL,
         &[
-            ("client_id", GOOGLE_GEMINI_CLI_OAUTH_CLIENT_ID),
+            ("client_id", &client_id),
             ("response_type", "code"),
-            ("redirect_uri", GOOGLE_GEMINI_CLI_OAUTH_REDIRECT_URI),
+            ("redirect_uri", &redirect_uri),
             ("scope", GOOGLE_GEMINI_CLI_OAUTH_SCOPES),
             ("code_challenge", &challenge),
             ("code_challenge_method", "S256"),
@@ -2431,7 +2572,7 @@ pub fn start_google_gemini_cli_oauth() -> Result<OAuthStartInfo> {
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
-        redirect_uri: Some(GOOGLE_GEMINI_CLI_OAUTH_REDIRECT_URI.to_string()),
+        redirect_uri: Some(redirect_uri),
         callback_server: None,
     })
 }
@@ -2439,12 +2580,14 @@ pub fn start_google_gemini_cli_oauth() -> Result<OAuthStartInfo> {
 /// Start Google Antigravity OAuth by generating an authorization URL and PKCE verifier.
 pub fn start_google_antigravity_oauth() -> Result<OAuthStartInfo> {
     let (verifier, challenge) = generate_pkce();
+    let client_id = google_antigravity_oauth_client_id();
+    let redirect_uri = google_antigravity_oauth_redirect_uri();
     let url = build_url_with_query(
         GOOGLE_ANTIGRAVITY_OAUTH_AUTHORIZE_URL,
         &[
-            ("client_id", GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_ID),
+            ("client_id", &client_id),
             ("response_type", "code"),
-            ("redirect_uri", GOOGLE_ANTIGRAVITY_OAUTH_REDIRECT_URI),
+            ("redirect_uri", &redirect_uri),
             ("scope", GOOGLE_ANTIGRAVITY_OAUTH_SCOPES),
             ("code_challenge", &challenge),
             ("code_challenge_method", "S256"),
@@ -2462,7 +2605,7 @@ pub fn start_google_antigravity_oauth() -> Result<OAuthStartInfo> {
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
-        redirect_uri: Some(GOOGLE_ANTIGRAVITY_OAUTH_REDIRECT_URI.to_string()),
+        redirect_uri: Some(redirect_uri),
         callback_server: None,
     })
 }
@@ -2472,10 +2615,11 @@ async fn discover_google_gemini_cli_project_id(
     access_token: &str,
 ) -> Result<String> {
     let env_project = google_project_id_from_env();
+    let platform_upper = crate::platform::os_name().to_ascii_uppercase();
     let mut payload = serde_json::json!({
         "metadata": {
-            "ideType": "IDE_UNSPECIFIED",
-            "platform": "PLATFORM_UNSPECIFIED",
+            "ideType": "CLI",
+            "platform": platform_upper,
             "pluginType": "GEMINI",
         }
     });
@@ -2522,10 +2666,11 @@ async fn discover_google_antigravity_project_id(
     client: &crate::http::client::Client,
     access_token: &str,
 ) -> Result<String> {
+    let platform_upper = crate::platform::os_name().to_ascii_uppercase();
     let payload = serde_json::json!({
         "metadata": {
-            "ideType": "IDE_UNSPECIFIED",
-            "platform": "PLATFORM_UNSPECIFIED",
+            "ideType": "CLI",
+            "platform": platform_upper,
             "pluginType": "GEMINI",
         }
     });
@@ -2552,7 +2697,7 @@ async fn discover_google_antigravity_project_id(
         }
     }
 
-    Ok(GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string())
+    Ok(google_antigravity_default_project_id())
 }
 
 fn parse_code_assist_project_id(value: &serde_json::Value) -> Option<String> {
@@ -2631,13 +2776,16 @@ pub async fn complete_google_gemini_cli_oauth(
     }
 
     let client = crate::http::client::Client::new();
+    let gc_client_id = google_gemini_cli_oauth_client_id();
+    let gc_client_secret = google_gemini_cli_oauth_client_secret();
+    let gc_redirect_uri = google_gemini_cli_oauth_redirect_uri();
     let oauth_response = exchange_google_authorization_code(
         &client,
         GOOGLE_GEMINI_CLI_OAUTH_TOKEN_URL,
-        GOOGLE_GEMINI_CLI_OAUTH_CLIENT_ID,
-        GOOGLE_GEMINI_CLI_OAUTH_CLIENT_SECRET,
+        &gc_client_id,
+        &gc_client_secret,
         &code,
-        GOOGLE_GEMINI_CLI_OAUTH_REDIRECT_URI,
+        &gc_redirect_uri,
         verifier,
     )
     .await?;
@@ -2669,13 +2817,16 @@ pub async fn complete_google_antigravity_oauth(
     }
 
     let client = crate::http::client::Client::new();
+    let ga_client_id = google_antigravity_oauth_client_id();
+    let ga_client_secret = google_antigravity_oauth_client_secret();
+    let ga_redirect_uri = google_antigravity_oauth_redirect_uri();
     let oauth_response = exchange_google_authorization_code(
         &client,
         GOOGLE_ANTIGRAVITY_OAUTH_TOKEN_URL,
-        GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_ID,
-        GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_SECRET,
+        &ga_client_id,
+        &ga_client_secret,
         &code,
-        GOOGLE_ANTIGRAVITY_OAUTH_REDIRECT_URI,
+        &ga_redirect_uri,
         verifier,
     )
     .await?;
@@ -2756,11 +2907,13 @@ async fn refresh_google_gemini_cli_oauth_token(
     refresh_token: &str,
     project_id: &str,
 ) -> Result<AuthCredential> {
+    let gc_client_id = google_gemini_cli_oauth_client_id();
+    let gc_client_secret = google_gemini_cli_oauth_client_secret();
     refresh_google_oauth_token_with_project(
         client,
         GOOGLE_GEMINI_CLI_OAUTH_TOKEN_URL,
-        GOOGLE_GEMINI_CLI_OAUTH_CLIENT_ID,
-        GOOGLE_GEMINI_CLI_OAUTH_CLIENT_SECRET,
+        &gc_client_id,
+        &gc_client_secret,
         refresh_token,
         project_id,
         "google-gemini-cli",
@@ -2773,11 +2926,13 @@ async fn refresh_google_antigravity_oauth_token(
     refresh_token: &str,
     project_id: &str,
 ) -> Result<AuthCredential> {
+    let ga_client_id = google_antigravity_oauth_client_id();
+    let ga_client_secret = google_antigravity_oauth_client_secret();
     refresh_google_oauth_token_with_project(
         client,
         GOOGLE_ANTIGRAVITY_OAUTH_TOKEN_URL,
-        GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_ID,
-        GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_SECRET,
+        &ga_client_id,
+        &ga_client_secret,
         refresh_token,
         project_id,
         "google-antigravity",
@@ -2795,10 +2950,11 @@ async fn start_kimi_code_device_flow_with_client(
     client: &crate::http::client::Client,
     oauth_host: &str,
 ) -> Result<DeviceCodeResponse> {
+    let kimi_client_id = kimi_code_oauth_client_id();
     let url = kimi_code_endpoint_for_host(oauth_host, KIMI_CODE_DEVICE_AUTHORIZATION_PATH);
     let form_body = format!(
         "client_id={}",
-        percent_encode_component(KIMI_CODE_OAUTH_CLIENT_ID)
+        percent_encode_component(&kimi_client_id)
     );
     let mut request = client
         .post(&url)
@@ -2817,7 +2973,7 @@ async fn start_kimi_code_device_flow_with_client(
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
-    let redacted_text = redact_known_secrets(&text, &[KIMI_CODE_OAUTH_CLIENT_ID]);
+    let redacted_text = redact_known_secrets(&text, &[&kimi_client_id]);
     if !(200..300).contains(&status) {
         return Err(Error::auth(format!(
             "Kimi device authorization failed (HTTP {status}): {redacted_text}"
@@ -2839,10 +2995,11 @@ async fn poll_kimi_code_device_flow_with_client(
     oauth_host: &str,
     device_code: &str,
 ) -> DeviceFlowPollResult {
+    let kimi_client_id = kimi_code_oauth_client_id();
     let token_url = kimi_code_endpoint_for_host(oauth_host, KIMI_CODE_TOKEN_PATH);
     let form_body = format!(
         "client_id={}&device_code={}&grant_type={}",
-        percent_encode_component(KIMI_CODE_OAUTH_CLIENT_ID),
+        percent_encode_component(&kimi_client_id),
         percent_encode_component(device_code),
         percent_encode_component("urn:ietf:params:oauth:grant-type:device_code"),
     );
@@ -2908,7 +3065,7 @@ async fn poll_kimi_code_device_flow_with_client(
         refresh_token: oauth_response.refresh_token,
         expires: oauth_expires_at_ms(oauth_response.expires_in),
         token_url: Some(token_url),
-        client_id: Some(KIMI_CODE_OAUTH_CLIENT_ID.to_string()),
+        client_id: Some(kimi_client_id),
     })
 }
 
@@ -2917,9 +3074,10 @@ async fn refresh_kimi_code_oauth_token(
     token_url: &str,
     refresh_token: &str,
 ) -> Result<AuthCredential> {
+    let kimi_client_id = kimi_code_oauth_client_id();
     let form_body = format!(
         "client_id={}&grant_type=refresh_token&refresh_token={}",
-        percent_encode_component(KIMI_CODE_OAUTH_CLIENT_ID),
+        percent_encode_component(&kimi_client_id),
         percent_encode_component(refresh_token),
     );
     let mut request = client
@@ -2956,7 +3114,7 @@ async fn refresh_kimi_code_oauth_token(
             .unwrap_or_else(|| refresh_token.to_string()),
         expires: oauth_expires_at_ms(oauth_response.expires_in),
         token_url: Some(token_url.to_string()),
-        client_id: Some(KIMI_CODE_OAUTH_CLIENT_ID.to_string()),
+        client_id: Some(kimi_client_id),
     })
 }
 
