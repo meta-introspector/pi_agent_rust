@@ -340,10 +340,7 @@ impl Provider for GeminiProvider {
                     format!("antigravity/{antigravity_version} {platform}"),
                 );
             } else {
-                request = request.header(
-                    "User-Agent",
-                    crate::platform::pi_user_agent(),
-                );
+                request = request.header("User-Agent", crate::platform::pi_user_agent());
             }
 
             // Apply provider-specific custom headers from compat config.

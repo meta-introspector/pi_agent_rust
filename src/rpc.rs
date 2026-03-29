@@ -3461,6 +3461,30 @@ mod retry_tests {
     }
 
     #[test]
+    fn run_bash_rpc_large_output_completes_without_deadlock() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let (_abort_tx, abort_rx) = oneshot::channel();
+            let run = run_bash_rpc(tmp.path(), "yes x | head -c 1200000", abort_rx);
+
+            let result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(15),
+                Box::pin(run),
+            )
+            .await
+            .expect("rpc bash timed out; possible stdout/stderr reader deadlock")
+            .expect("rpc bash should succeed");
+
+            assert_eq!(result.exit_code, 0, "expected successful shell exit");
+            assert!(
+                result.truncated,
+                "large RPC bash output should truncate instead of blocking"
+            );
+        });
+    }
+
+    #[test]
     fn rpc_spill_file_abandon_clears_path_and_unlinks_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let spill_path = tmp.path().join("partial-rpc-bash.log");
@@ -4231,7 +4255,7 @@ async fn run_bash_rpc(
 
     fn pump_stream(
         mut reader: impl std::io::Read,
-        tx: std::sync::mpsc::SyncSender<StreamChunk>,
+        tx: std::sync::mpsc::Sender<StreamChunk>,
         kind: StreamKind,
     ) {
         let mut buf = [0u8; 8192];
@@ -4282,7 +4306,10 @@ async fn run_bash_rpc(
     let mut guard =
         crate::tools::ProcessGuard::new(child, crate::tools::ProcessCleanupMode::ProcessGroupTree);
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<StreamChunk>(128);
+    // Keep the pipe pump threads non-blocking on send(). A bounded channel can
+    // deadlock if the shell floods stdout/stderr faster than the async loop
+    // drains it, which in turn stops pipe draining and can strand the child.
+    let (tx, rx) = std::sync::mpsc::channel::<StreamChunk>();
     let tx_stdout = tx.clone();
     let _stdout_handle =
         std::thread::spawn(move || pump_stream(stdout, tx_stdout, StreamKind::Stdout));
@@ -4323,10 +4350,9 @@ async fn run_bash_rpc(
 
         if !cancelled && abort_rx.try_recv().is_ok() {
             cancelled = true;
-            let status_code = match guard.kill() {
-                Ok(Some(status)) => status.code().unwrap_or(-1),
-                _ => -1,
-            };
+            let status_code = guard
+                .kill()
+                .map_or(-1, |status| status.code().unwrap_or(-1));
             break status_code;
         }
 
@@ -4396,6 +4422,11 @@ async fn run_bash_rpc(
     // inherits stdout/stderr, the pipe remains open and `read()` blocks indefinitely,
     // which would cause `join()` to hang the entire agent.
     drop(rx);
+
+    // Explicitly reap the child to prevent zombie retention on macOS and other
+    // platforms where the polling path can observe process exit before the
+    // shell is fully reaped from its isolated process group.
+    let _ = guard.wait();
 
     // Explicitly drop the temp file handle to ensure any buffered data is flushed to disk
     // before we potentially return the path to the caller.

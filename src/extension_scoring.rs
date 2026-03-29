@@ -1445,8 +1445,9 @@ pub fn evaluate_off_policy(
     let mut max_seen_importance_weight: f64 = 0.0;
     for sample in &normalized_samples {
         sum_importance_weight += sample.importance_weight;
-        sum_importance_weight_sq =
-            sample.importance_weight.mul_add(sample.importance_weight, sum_importance_weight_sq);
+        sum_importance_weight_sq = sample
+            .importance_weight
+            .mul_add(sample.importance_weight, sum_importance_weight_sq);
         max_seen_importance_weight = max_seen_importance_weight.max(sample.importance_weight);
     }
     let effective_sample_size = if sum_importance_weight_sq > 0.0 {

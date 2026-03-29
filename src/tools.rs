@@ -1952,10 +1952,7 @@ pub(crate) async fn run_bash_command(
 
         if let Some(deadline) = terminate_deadline {
             if now >= deadline {
-                if let Some(status) = guard
-                    .kill()
-                    .map_err(|err| Error::tool("bash", format!("Failed to kill process: {err}")))?
-                {
+                if let Some(status) = guard.kill() {
                     exit_code = Some(exit_status_code(status));
                 }
                 break; // Guard now owns no child after kill()
@@ -1972,10 +1969,8 @@ pub(crate) async fn run_bash_command(
 
         if terminate_deadline.is_none() && cx.checkpoint().is_err() {
             cancelled = true;
-            exit_code = guard
-                .kill()
-                .map_err(|err| Error::tool("bash", format!("Failed to kill process: {err}")))?
-                .map(exit_status_code);
+            let _ = guard.kill();
+            exit_code = Some(-1);
             break;
         }
 
@@ -4773,14 +4768,18 @@ impl ProcessGuard {
             .map_or(Ok(None), std::process::Child::try_wait)
     }
 
-    pub(crate) fn kill(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+    pub(crate) fn kill(&mut self) -> Option<std::process::ExitStatus> {
         if let Some(mut child) = self.child.take() {
             cleanup_child(Some(child.id()), self.cleanup_mode);
             let _ = child.kill();
-            let status = child.wait()?;
-            return Ok(Some(status));
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            // We cannot return the exit status synchronously without blocking,
+            // so we return None to indicate the process was forcefully killed.
+            return None;
         }
-        Ok(None)
+        None
     }
 
     pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {

@@ -1320,6 +1320,7 @@ fn session_options_default_values() {
     assert!(opts.extension_paths.is_empty());
     assert!(opts.extension_policy.is_none());
     assert!(opts.repair_policy.is_none());
+    assert!(opts.include_cwd_in_prompt);
     assert_eq!(opts.max_tool_iterations, 50);
     assert!(opts.on_event.is_none());
     assert!(opts.on_tool_start.is_none());

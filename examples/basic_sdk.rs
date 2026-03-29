@@ -27,14 +27,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use pi::sdk::{
-    AgentEvent, AgentSessionHandle, ContentBlock, SessionOptions, create_agent_session,
-};
+use pi::sdk::{AgentEvent, AgentSessionHandle, ContentBlock, SessionOptions, create_agent_session};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize the async runtime (pi uses asupersync, not tokio).
-    let reactor =
-        asupersync::runtime::reactor::create_reactor().expect("failed to create reactor");
+    let reactor = asupersync::runtime::reactor::create_reactor().expect("failed to create reactor");
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .with_reactor(reactor)
         .build()
@@ -70,9 +67,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("[hook] tool started: {tool_name}");
         })),
         on_tool_end: Some(Arc::new(|tool_name, _output, is_error| {
-            eprintln!(
-                "[hook] tool ended: {tool_name} (error={is_error})"
-            );
+            eprintln!("[hook] tool ended: {tool_name} (error={is_error})");
         })),
 
         ..SessionOptions::default()
@@ -115,8 +110,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 } => {
                     // Print streaming text deltas to stderr as they arrive.
                     use pi::model::AssistantMessageEvent;
-                    if let AssistantMessageEvent::TextDelta { delta, .. } =
-                        assistant_message_event
+                    if let AssistantMessageEvent::TextDelta { delta, .. } = assistant_message_event
                     {
                         eprint!("{delta}");
                     }

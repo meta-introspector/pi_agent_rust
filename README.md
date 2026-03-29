@@ -560,8 +560,10 @@ For drop-in adoption, packaging and invocation compatibility follows this contra
 - This section covers packaging/invocation behavior only; strict functional drop-in replacement messaging is governed by the release certification gates in `docs/dropin-certification-contract.json`.
 
 - Canonical executable name is `pi` across release assets and installer-managed installs.
+- Installer-managed installs also create an `rpi` compatibility launcher when no conflicting `rpi` command already exists on your PATH.
 - Existing TypeScript `pi` installs can be migrated in place; the prior command is preserved as `legacy-pi`.
 - If you keep TypeScript `pi` as canonical (`--keep-existing-pi`), Rust Pi is installed as `pi-rust`.
+- On Apple Silicon, the installer prefers the native arm64 artifact even when launched from a Rosetta-translated shell.
 - Version-pinned installs are supported via `install.sh --version vX.Y.Z` for deterministic rollouts.
 - Every GitHub release ships platform binaries plus `SHA256SUMS` for integrity validation.
 
@@ -1609,7 +1611,7 @@ Pi also supports a v2 sidecar store next to JSONL sessions for faster resume and
 
 ### Authentication & Credential Management
 
-Beyond simple API keys, Pi supports OAuth, AWS credential chains, service key exchange, and bearer-token auth. Credentials are stored in `~/.pi/agent/auth.json` with file-locked access to prevent corruption from concurrent instances.
+Beyond simple API keys, Pi supports OAuth, AWS credential chains, service key exchange, and bearer-token auth. Credentials are stored in `~/.pi/agent/auth.json` with file-locked access to prevent corruption from concurrent instances. Stored API keys can be literal strings, `$ENV:VAR_NAME` references, or `$CMD:shell command` / `$COMMAND:shell command` sources that resolve trimmed stdout at request time.
 
 | Mechanism | Providers | Details |
 |-----------|-----------|---------|

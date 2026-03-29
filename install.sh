@@ -52,6 +52,7 @@ WSL_DETECTED=0
 # ask|yes|no
 ADOPT_MODE="ask"
 LEGACY_ALIAS_NAME="${LEGACY_ALIAS_NAME:-legacy-pi}"
+COMPAT_ALIAS_NAME="${COMPAT_ALIAS_NAME:-rpi}"
 
 OS=""
 ARCH=""
@@ -74,6 +75,8 @@ LEGACY_ALIAS_PATH=""
 LEGACY_TARGET_PATH=""
 LEGACY_MOVED_FROM=""
 LEGACY_MOVED_TO=""
+COMPAT_ALIAS_PATH=""
+COMPAT_ALIAS_STATUS="pending"
 
 PATH_MARKER="# pi-agent-rust installer PATH"
 PATH_UPDATED_FILES=""
@@ -247,6 +250,12 @@ capture_version_line() {
   out="$(run_command_with_timeout_capture 2 "$bin_path" --version || true)"
   out="$(printf '%s\n' "$out" | head -1)"
   printf '%s\n' "$out"
+}
+
+is_managed_alias() {
+  local path="$1"
+  [ -f "$path" ] || return 1
+  grep -q "pi_agent_rust installer managed alias" "$path" 2>/dev/null
 }
 
 setup_proxy() {
@@ -952,6 +961,21 @@ resolve_version() {
 detect_platform() {
   OS=$(uname -s | tr '[:upper:]' '[:lower:]')
   ARCH=$(uname -m)
+
+  if [ "$OS" = "darwin" ] && [ "$ARCH" = "x86_64" ]; then
+    local darwin_arm64_capable=""
+    darwin_arm64_capable=$(sysctl -in hw.optional.arm64 2>/dev/null || true)
+    if [ "$darwin_arm64_capable" = "1" ]; then
+      local darwin_translated=""
+      darwin_translated=$(sysctl -in sysctl.proc_translated 2>/dev/null || true)
+      ARCH="arm64"
+      if [ "$darwin_translated" = "1" ]; then
+        info "Rosetta shell detected on Apple Silicon; preferring native arm64 binary"
+      else
+        info "Apple Silicon host detected; preferring native arm64 binary"
+      fi
+    fi
+  fi
 
   case "$ARCH" in
     x86_64|amd64)
@@ -1760,6 +1784,25 @@ install_binary_file() {
   ok "Installed $FINAL_BIN_NAME to $INSTALL_BIN_PATH"
 }
 
+create_managed_alias_wrapper() {
+  local alias_path="$1"
+  local target_path="$2"
+  local label="$3"
+
+  if [ -z "$alias_path" ] || [ -z "$target_path" ] || [ -z "$label" ]; then
+    return 1
+  fi
+
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# pi_agent_rust installer managed alias\n'
+    printf 'set -euo pipefail\n'
+    printf 'exec %q "$@"\n' "$target_path"
+  } > "$alias_path"
+  chmod 0755 "$alias_path"
+  ok "Created ${label} alias: $alias_path"
+}
+
 choose_legacy_alias_path() {
   local candidate="$DEST/$LEGACY_ALIAS_NAME"
   if [ ! -e "$candidate" ]; then
@@ -1799,14 +1842,7 @@ create_legacy_alias_wrapper() {
     return 1
   fi
 
-  {
-    printf '#!/usr/bin/env bash\n'
-    printf '# pi_agent_rust installer managed alias\n'
-    printf 'set -euo pipefail\n'
-    printf 'exec %q "$@"\n' "$target_path"
-  } > "$alias_path"
-  chmod 0755 "$alias_path"
-  ok "Created legacy alias: $alias_path"
+  create_managed_alias_wrapper "$alias_path" "$target_path" "legacy"
 }
 
 prepare_typescript_migration() {
@@ -1848,6 +1884,41 @@ prepare_typescript_migration() {
   fi
 
   create_legacy_alias_wrapper "$LEGACY_ALIAS_PATH" "$LEGACY_TARGET_PATH"
+}
+
+ensure_compat_alias() {
+  COMPAT_ALIAS_PATH=""
+
+  if [ -n "$EXE_EXT" ]; then
+    COMPAT_ALIAS_STATUS="skipped (managed ${COMPAT_ALIAS_NAME} alias is unix-only)"
+    return 0
+  fi
+
+  if [ -z "$COMPAT_ALIAS_NAME" ] || [ "$COMPAT_ALIAS_NAME" = "$FINAL_BIN_NAME" ]; then
+    COMPAT_ALIAS_STATUS="skipped (no secondary alias requested)"
+    return 0
+  fi
+
+  local alias_path="$DEST/$COMPAT_ALIAS_NAME"
+  if [ -e "$alias_path" ] && ! is_managed_alias "$alias_path"; then
+    COMPAT_ALIAS_STATUS="skipped (existing non-managed ${COMPAT_ALIAS_NAME} at ${alias_path})"
+    warn "Existing ${COMPAT_ALIAS_NAME} at ${alias_path} is not installer-managed; leaving it untouched"
+    return 0
+  fi
+
+  if [ ! -e "$alias_path" ]; then
+    local existing_command=""
+    existing_command=$(command -v "$COMPAT_ALIAS_NAME" 2>/dev/null || true)
+    if [ -n "$existing_command" ] && [ "$existing_command" != "$alias_path" ]; then
+      COMPAT_ALIAS_STATUS="skipped (existing ${COMPAT_ALIAS_NAME} command at ${existing_command})"
+      warn "Existing ${COMPAT_ALIAS_NAME} command detected at ${existing_command}; skipping managed alias"
+      return 0
+    fi
+  fi
+
+  create_managed_alias_wrapper "$alias_path" "$INSTALL_BIN_PATH" "$COMPAT_ALIAS_NAME"
+  COMPAT_ALIAS_PATH="$alias_path"
+  COMPAT_ALIAS_STATUS="installed (${COMPAT_ALIAS_NAME} -> $INSTALL_BIN_PATH)"
 }
 
 maybe_add_path() {
@@ -3178,6 +3249,8 @@ write_state() {
     printf 'PIAR_LEGACY_TARGET_PATH=%q\n' "$LEGACY_TARGET_PATH"
     printf 'PIAR_LEGACY_MOVED_FROM=%q\n' "$LEGACY_MOVED_FROM"
     printf 'PIAR_LEGACY_MOVED_TO=%q\n' "$LEGACY_MOVED_TO"
+    printf 'PIAR_COMPAT_ALIAS_PATH=%q\n' "$COMPAT_ALIAS_PATH"
+    printf 'PIAR_COMPAT_ALIAS_STATUS=%q\n' "$COMPAT_ALIAS_STATUS"
     printf 'PIAR_PATH_MARKER=%q\n' "$PATH_MARKER"
     printf 'PIAR_PATH_UPDATED_FILES=%q\n' "$PATH_UPDATED_FILES"
     printf 'PIAR_INSTALLED_AT_UTC=%q\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -3221,6 +3294,9 @@ print_summary() {
   fi
   if [ "$WSL_DETECTED" -eq 1 ]; then
     lines+=("Platform:  WSL detected")
+  fi
+  if [ "$COMPAT_ALIAS_STATUS" != "pending" ]; then
+    lines+=("Alias:     $COMPAT_ALIAS_STATUS")
   fi
   lines+=("Skills:    $AGENT_SKILL_STATUS")
   if [ -n "$AGENT_SKILL_CLAUDE_PATH" ] && [ -f "$AGENT_SKILL_CLAUDE_PATH/SKILL.md" ]; then
@@ -3305,6 +3381,7 @@ main() {
         write_state
       fi
     fi
+    ensure_compat_alias
     maybe_add_path
     maybe_install_completions
     cleanup_legacy_agent_settings
@@ -3361,10 +3438,15 @@ main() {
 
   prepare_typescript_migration
   install_binary_file "$source_bin"
+  ensure_compat_alias
 
   if [ "$VERIFY" -eq 1 ]; then
     "$INSTALL_BIN_PATH" --version >/dev/null
     ok "Verification passed ($FINAL_BIN_NAME --version)"
+    if [ -n "$COMPAT_ALIAS_PATH" ]; then
+      "$COMPAT_ALIAS_PATH" --version >/dev/null
+      ok "Verification passed ($(basename "$COMPAT_ALIAS_PATH") --version)"
+    fi
   fi
 
   maybe_add_path

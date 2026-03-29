@@ -13,7 +13,7 @@ use crate::model::{
     UserMessage,
 };
 use crate::session_index::{
-    SessionIndex, enqueue_session_index_snapshot_update, session_file_stats, is_session_file_path,
+    SessionIndex, enqueue_session_index_snapshot_update, is_session_file_path, session_file_stats,
 };
 use crate::session_store_v2::{self, SessionStoreV2};
 use crate::tui::PiConsole;
@@ -2917,7 +2917,6 @@ async fn scan_sessions_on_disk(
     let recv_result = rx.recv(cx.cx()).await;
     finish_worker_result(handle, recv_result, "Scan task cancelled")
 }
-
 
 fn load_session_meta(path: &Path) -> Result<SessionPickEntry> {
     match path.extension().and_then(|ext| ext.to_str()) {

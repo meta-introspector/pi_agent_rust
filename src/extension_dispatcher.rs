@@ -2792,6 +2792,10 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                         return Err(format!("Read stderr: {err}"));
                     }
 
+                    // Explicitly reap to avoid leaving a zombie behind after a
+                    // successful try_wait()-observed exit on isolated process groups.
+                    let _ = child.wait();
+
                     let code = exit_status_code(status);
                     let _ = tx.send(ExecStreamFrame::Final { code, killed });
                     Ok(())

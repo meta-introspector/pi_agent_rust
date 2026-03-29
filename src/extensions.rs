@@ -22286,7 +22286,7 @@ async fn dispatch_hostcall_exec_ref_with_limit(
 
     fn pump_stream<R: std::io::Read>(
         mut reader: R,
-        tx: &std::sync::mpsc::SyncSender<ExecStreamFrame>,
+        tx: &std::sync::mpsc::Sender<ExecStreamFrame>,
         stdout: bool,
     ) -> std::result::Result<(), String> {
         let mut buf = [0u8; 4096];
@@ -22487,7 +22487,10 @@ async fn dispatch_hostcall_exec_ref_with_limit(
             }
 
             let cmd = cmd.to_string();
-            let (tx, rx) = mpsc::sync_channel::<ExecStreamFrame>(256);
+            // Keep the pump threads draining pipes even if the runtime is
+            // temporarily behind on chunk delivery. Bounded channels can
+            // recreate the same shell/pipe deadlock seen in the main bash tool.
+            let (tx, rx) = mpsc::channel::<ExecStreamFrame>();
             let cancel = Arc::new(AtomicBool::new(false));
             let cancel_worker = Arc::clone(&cancel);
             let call_id_for_error = call_id.to_string();
@@ -22558,6 +22561,10 @@ async fn dispatch_hostcall_exec_ref_with_limit(
                     if let Err(err) = stderr_result {
                         return Err(format!("Read stderr: {err}"));
                     }
+
+                    // Explicitly reap to avoid leaving a zombie behind after a
+                    // successful try_wait()-observed exit on isolated process groups.
+                    let _ = child.wait();
 
                     let code = exit_status_code(status);
                     let _ = tx.send(ExecStreamFrame::Final { code, killed });
@@ -50264,6 +50271,96 @@ mod tests {
                 }
                 other => panic!("expected exec success outcome, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn js_runtime_pump_once_exec_streaming_large_output_completes_without_deadlock() {
+        futures::executor::block_on(async {
+            let dir = tempdir().expect("tempdir");
+            let manager = ExtensionManager::new();
+            let host = JsRuntimeHost {
+                tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
+                manager_ref: Arc::downgrade(&manager.inner),
+                manager_snapshot: Arc::clone(&manager.snapshot),
+                manager_snapshot_version: Arc::clone(&manager.snapshot_version),
+                http: Arc::new(HttpConnector::with_defaults()),
+                policy: ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    max_memory_mb: 256,
+                    default_caps: Vec::new(),
+                    deny_caps: Vec::new(),
+                    ..Default::default()
+                },
+                interceptor: None,
+            };
+
+            let runtime = PiJsRuntime::new().await.expect("runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.bigChunks = [];
+                    globalThis.bigDone = false;
+                    globalThis.bigErr = null;
+                    (async () => {
+                        try {
+                            const stream = pi.exec("sh", ["-c", "yes x | head -c 1200000"], { stream: true });
+                            for await (const chunk of stream) {
+                                globalThis.bigChunks.push(chunk);
+                            }
+                            globalThis.bigDone = true;
+                        } catch (e) {
+                            globalThis.bigErr = e.message || String(e);
+                        }
+                    })();
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            for _ in 0..1024 {
+                let has_pending = pump_js_runtime_once(&runtime, &host)
+                    .await
+                    .expect("pump_once");
+                if !has_pending {
+                    break;
+                }
+            }
+
+            assert!(
+                !runtime.has_pending(),
+                "runtime should have no pending tasks after large streaming exec"
+            );
+
+            let big_chunks = runtime
+                .read_global_json("bigChunks")
+                .await
+                .expect("read bigChunks");
+            let entries = big_chunks.as_array().expect("bigChunks array");
+            assert!(
+                !entries.is_empty(),
+                "expected streaming exec to yield chunks before completion"
+            );
+            assert_eq!(
+                entries.last().and_then(|entry| entry.get("code")),
+                Some(&json!(0)),
+                "expected final success chunk: {entries:?}"
+            );
+            assert_eq!(
+                runtime
+                    .read_global_json("bigDone")
+                    .await
+                    .expect("read bigDone"),
+                Value::Bool(true)
+            );
+            assert_eq!(
+                runtime
+                    .read_global_json("bigErr")
+                    .await
+                    .expect("read bigErr"),
+                Value::Null
+            );
         });
     }
 }

@@ -5,10 +5,8 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bubbletea::{Cmd, KeyMsg, KeyType, Message, Program, quit};
 
@@ -16,7 +14,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::session::{Session, encode_cwd};
 use crate::session_index::session_file_stats;
-use crate::session_index::{SessionIndex, SessionMeta, is_session_file_path, build_meta_from_file};
+use crate::session_index::{SessionIndex, SessionMeta, build_meta_from_file, is_session_file_path};
 use crate::theme::{Theme, TuiStyles};
 
 /// Format a timestamp for display.
@@ -589,6 +587,7 @@ fn try_trash_with_cmd(path: &Path, trash_cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SessionHeader;
 
     #[cfg(feature = "sqlite-sessions")]
     use crate::model::UserContent;

@@ -18,14 +18,14 @@ PATH_MARKER="# pi-agent-rust installer PATH"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/pi-agent-rust"
 STATE_FILE="$STATE_DIR/install-state.env"
-STATE_LOADED=0
 
 PIAR_INSTALL_BIN=""
-PIAR_INSTALL_BIN_NAME=""
 PIAR_ADOPTED_TYPESCRIPT="0"
 PIAR_LEGACY_ALIAS_PATH=""
 PIAR_LEGACY_MOVED_FROM=""
 PIAR_LEGACY_MOVED_TO=""
+PIAR_COMPAT_ALIAS_PATH=""
+PIAR_COMPAT_ALIAS_STATUS=""
 PIAR_PATH_MARKER=""
 PIAR_AGENT_SKILL_STATUS=""
 PIAR_AGENT_SKILL_CLAUDE_PATH=""
@@ -196,7 +196,6 @@ load_state() {
 
   # shellcheck disable=SC1090
   source "$STATE_FILE"
-  STATE_LOADED=1
 
   if [ -n "${PIAR_PATH_MARKER:-}" ]; then
     PATH_MARKER="$PIAR_PATH_MARKER"
@@ -551,6 +550,13 @@ $HOME/.local/bin/pi-rust
 EOF_CAND
 }
 
+fallback_alias_candidates() {
+  cat <<EOF_CAND
+$HOME/.local/bin/rpi
+/usr/local/bin/rpi
+EOF_CAND
+}
+
 remove_installed_binary() {
   local removed=0
 
@@ -625,6 +631,29 @@ remove_legacy_alias() {
   fi
 }
 
+remove_compat_alias() {
+  local removed=0
+
+  if [ -n "$PIAR_COMPAT_ALIAS_PATH" ] && [ -e "$PIAR_COMPAT_ALIAS_PATH" ]; then
+    if is_managed_alias "$PIAR_COMPAT_ALIAS_PATH"; then
+      remove_file_if_exists "$PIAR_COMPAT_ALIAS_PATH" && removed=1
+      ok "Removed compatibility alias: $PIAR_COMPAT_ALIAS_PATH"
+    else
+      warn "Skipping non-managed compatibility alias: $PIAR_COMPAT_ALIAS_PATH"
+    fi
+  fi
+
+  if [ "$removed" -eq 0 ]; then
+    while IFS= read -r cand; do
+      [ -n "$cand" ] || continue
+      if [ -e "$cand" ] && is_managed_alias "$cand"; then
+        remove_file_if_exists "$cand" && removed=1
+        ok "Removed compatibility alias: $cand"
+      fi
+    done < <(fallback_alias_candidates)
+  fi
+}
+
 remove_installed_skills() {
   local codex_home="${CODEX_HOME:-$HOME/.codex}"
   local claude_dir="${PIAR_AGENT_SKILL_CLAUDE_PATH:-$HOME/.claude/skills/${AGENT_SKILL_NAME}}"
@@ -679,6 +708,9 @@ plan_summary() {
   if [ -n "$PIAR_LEGACY_ALIAS_PATH" ]; then
     lines+=("Legacy alias: $PIAR_LEGACY_ALIAS_PATH")
   fi
+  if [ -n "$PIAR_COMPAT_ALIAS_PATH" ] || [ -n "$PIAR_COMPAT_ALIAS_STATUS" ]; then
+    lines+=("Compatibility alias: ${PIAR_COMPAT_ALIAS_PATH:-$PIAR_COMPAT_ALIAS_STATUS}")
+  fi
   if [ -n "$PIAR_AGENT_SKILL_CLAUDE_PATH" ] || [ -n "$PIAR_AGENT_SKILL_CODEX_PATH" ]; then
     lines+=("Agent skills: remove installer-managed Claude/Codex skill dirs")
   fi
@@ -724,6 +756,7 @@ main() {
 
   cleanup_legacy_agent_settings
   remove_installed_binary
+  remove_compat_alias
   remove_legacy_alias
   remove_installed_skills
   restore_moved_typescript_pi

@@ -884,15 +884,24 @@ impl AuthStorage {
     }
 }
 
-/// Resolve an API key string that may contain a `$ENV:VAR_NAME` prefix.
+/// Resolve an API key string that may contain a `$ENV:VAR_NAME` or
+/// `$CMD:shell command` prefix.
 ///
-/// - Plain string → returned as-is (backward compatible literal key).
-/// - `$ENV:VAR_NAME` → resolves the named environment variable at runtime.
+/// - Plain string → returned as-is (backward compatible literal key)
+/// - `$ENV:VAR_NAME` → resolves the named environment variable at runtime
+/// - `$CMD:shell command` / `$COMMAND:shell command` → runs the command and
+///   uses trimmed stdout as the key
 ///
 /// Returns `None` when the key references an env var that is unset or empty.
-/// Returns `Err` with a descriptive message for malformed `$ENV:` references.
+/// Returns `None` when the command succeeds but produces empty output.
+/// Returns `Err` with a descriptive message for malformed `$ENV:` / `$CMD:`
+/// references or command execution failures.
 fn resolve_api_key_source(raw: &str) -> std::result::Result<Option<String>, String> {
-    resolve_api_key_source_with_env(raw, |var| std::env::var(var).ok())
+    resolve_api_key_source_with_resolvers(
+        raw,
+        |var| std::env::var(var).ok(),
+        run_api_key_source_command,
+    )
 }
 
 /// Testable version of [`resolve_api_key_source`] with injectable env lookup.
@@ -903,11 +912,25 @@ fn resolve_api_key_source_with_env<F>(
 where
     F: FnOnce(&str) -> Option<String>,
 {
+    resolve_api_key_source_with_resolvers(raw, env_lookup, |_command| {
+        Err("API key command resolution is not available in this test helper".to_string())
+    })
+}
+
+fn resolve_api_key_source_with_resolvers<F, G>(
+    raw: &str,
+    env_lookup: F,
+    mut command_runner: G,
+) -> std::result::Result<Option<String>, String>
+where
+    F: FnOnce(&str) -> Option<String>,
+    G: FnMut(&str) -> std::result::Result<Option<String>, String>,
+{
     if let Some(var_name) = raw.strip_prefix("$ENV:") {
         if var_name.is_empty() {
             return Err("$ENV: prefix requires a variable name (e.g. $ENV:MY_API_KEY)".to_string());
         }
-        match env_lookup(var_name) {
+        return match env_lookup(var_name) {
             Some(value) if !value.trim().is_empty() => Ok(Some(value.trim().to_string())),
             Some(_) => {
                 tracing::warn!(
@@ -925,10 +948,81 @@ where
                 );
                 Ok(None)
             }
+        };
+    }
+
+    if let Some(command) = raw
+        .strip_prefix("$CMD:")
+        .or_else(|| raw.strip_prefix("$COMMAND:"))
+    {
+        let command = command.trim();
+        if command.is_empty() {
+            return Err(
+                "$CMD: prefix requires a shell command (e.g. $CMD:op read \"op://vault/item/field\" --no-newline)"
+                    .to_string(),
+            );
         }
-    } else {
-        // Plain literal key — backward compatible.
-        Ok(Some(raw.to_string()))
+        return command_runner(command).map(|resolved| {
+            resolved.and_then(|value| {
+                let trimmed = value.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
+        });
+    }
+
+    // Plain literal key — backward compatible.
+    Ok(Some(raw.to_string()))
+}
+
+fn run_api_key_source_command(command: &str) -> std::result::Result<Option<String>, String> {
+    let output = build_api_key_command_shell(command)
+        .output()
+        .map_err(|e| format!("Failed to run API key command: {e}"))?;
+
+    if !output.status.success() {
+        let status = output.status.code().map_or_else(
+            || "terminated by signal".to_string(),
+            |code| format!("exit code {code}"),
+        );
+        return Err(format!("API key command failed ({status})"));
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| "API key command output is not valid UTF-8".to_string())?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        tracing::warn!(
+            event = "pi.auth.key_command_empty",
+            "API key command succeeded but produced empty output"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
+fn build_api_key_command_shell(command: &str) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        let mut shell = std::process::Command::new("cmd");
+        shell.arg("/C").arg(command);
+        shell
+    }
+
+    #[cfg(not(windows))]
+    {
+        let shell_path = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .unwrap_or("sh");
+        let mut shell = std::process::Command::new(shell_path);
+        if shell_path.ends_with("bash") {
+            shell.arg("-lc");
+        } else {
+            shell.arg("-c");
+        }
+        shell.arg(command);
+        shell
     }
 }
 
@@ -994,8 +1088,8 @@ fn resolve_external_provider_api_key(provider: &str) -> Option<String> {
             read_external_gemini_access_payload(project.as_deref())
         }
         "google-antigravity" => {
-            let project = google_project_id_from_env()
-                .unwrap_or_else(google_antigravity_default_project_id);
+            let project =
+                google_project_id_from_env().unwrap_or_else(google_antigravity_default_project_id);
             read_external_gemini_access_payload(Some(project.as_str()))
         }
         "kimi-for-coding" => read_external_kimi_code_access_token(),
@@ -1025,8 +1119,8 @@ pub fn external_setup_source(provider: &str) -> Option<&'static str> {
                 .then_some("Gemini CLI (~/.gemini/oauth_creds.json)")
         }
         "google-antigravity" => {
-            let project = google_project_id_from_env()
-                .unwrap_or_else(google_antigravity_default_project_id);
+            let project =
+                google_project_id_from_env().unwrap_or_else(google_antigravity_default_project_id);
             if read_external_gemini_access_payload(Some(project.as_str())).is_some() {
                 Some("Gemini CLI (~/.gemini/oauth_creds.json)")
             } else {
@@ -1426,7 +1520,7 @@ where
         }),
         Some(AuthCredential::ApiKey { key }) => {
             // Legacy: treat stored API key as bearer token for Bedrock.
-            // Supports $ENV: prefix for env-var-backed keys.
+            // Supports $ENV: and $CMD: prefixes for dynamically resolved keys.
             match resolve_api_key_source(key) {
                 Ok(Some(resolved)) => Some(AwsResolvedCredentials::Bearer {
                     token: resolved,
@@ -2363,16 +2457,14 @@ pub async fn complete_anthropic_oauth(code_input: &str, verifier: &str) -> Resul
     let redirect_uri = anthropic_oauth_redirect_uri();
 
     let client = crate::http::client::Client::new();
-    let request = client
-        .post(&token_url)
-        .json(&serde_json::json!({
-            "grant_type": "authorization_code",
-            "client_id": client_id,
-            "code": code,
-            "state": state,
-            "redirect_uri": redirect_uri,
-            "code_verifier": verifier,
-        }))?;
+    let request = client.post(&token_url).json(&serde_json::json!({
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "code": code,
+        "state": state,
+        "redirect_uri": redirect_uri,
+        "code_verifier": verifier,
+    }))?;
 
     let response = Box::pin(request.send())
         .await
@@ -2410,13 +2502,11 @@ async fn refresh_anthropic_oauth_token(
     let client_id = anthropic_oauth_client_id();
     let token_url = anthropic_oauth_token_url();
 
-    let request = client
-        .post(&token_url)
-        .json(&serde_json::json!({
-            "grant_type": "refresh_token",
-            "client_id": client_id,
-            "refresh_token": refresh_token,
-        }))?;
+    let request = client.post(&token_url).json(&serde_json::json!({
+        "grant_type": "refresh_token",
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+    }))?;
 
     let response = Box::pin(request.send())
         .await
@@ -2952,10 +3042,7 @@ async fn start_kimi_code_device_flow_with_client(
 ) -> Result<DeviceCodeResponse> {
     let kimi_client_id = kimi_code_oauth_client_id();
     let url = kimi_code_endpoint_for_host(oauth_host, KIMI_CODE_DEVICE_AUTHORIZATION_PATH);
-    let form_body = format!(
-        "client_id={}",
-        percent_encode_component(&kimi_client_id)
-    );
+    let form_body = format!("client_id={}", percent_encode_component(&kimi_client_id));
     let mut request = client
         .post(&url)
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -8094,6 +8181,75 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_api_key_source_command_resolves() {
+        let result = resolve_api_key_source_with_resolvers(
+            "$CMD:pass show openai/api-key",
+            |_| None,
+            |command| {
+                assert_eq!(command, "pass show openai/api-key");
+                Ok(Some("resolved-command-key".to_string()))
+            },
+        );
+        assert_eq!(result.unwrap(), Some("resolved-command-key".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_api_key_source_command_alias_prefix_resolves() {
+        let result = resolve_api_key_source_with_resolvers(
+            "$COMMAND:op read secret",
+            |_| None,
+            |command| {
+                assert_eq!(command, "op read secret");
+                Ok(Some("from-command-alias".to_string()))
+            },
+        );
+        assert_eq!(result.unwrap(), Some("from-command-alias".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_api_key_source_command_trims_whitespace() {
+        let result = resolve_api_key_source_with_resolvers(
+            "$CMD:security find-generic-password",
+            |_| None,
+            |_| Ok(Some("  spaced-command-key  ".to_string())),
+        );
+        assert_eq!(result.unwrap(), Some("spaced-command-key".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_api_key_source_command_empty_returns_none() {
+        let result = resolve_api_key_source_with_resolvers(
+            "$CMD:echo key",
+            |_| None,
+            |_| Ok(Some("   ".to_string())),
+        );
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn test_resolve_api_key_source_command_runner_error_propagates() {
+        let result = resolve_api_key_source_with_resolvers(
+            "$CMD:bad-command",
+            |_| None,
+            |_| Err("boom".to_string()),
+        );
+        assert_eq!(result.unwrap_err(), "boom");
+    }
+
+    #[test]
+    fn test_resolve_api_key_source_command_prefix_no_command_is_error() {
+        let result = resolve_api_key_source_with_resolvers(
+            "$CMD:   ",
+            |_| None,
+            |_| {
+                panic!("command runner should not be called for empty command");
+            },
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("requires a shell command"));
+    }
+
+    #[test]
     fn test_resolve_api_key_source_env_var_missing_returns_none() {
         let result = resolve_api_key_source_with_env("$ENV:NONEXISTENT_VAR", |_| None);
         assert_eq!(result.unwrap(), None);
@@ -8172,6 +8328,21 @@ mod tests {
         match parsed {
             AuthCredential::ApiKey { key } => {
                 assert_eq!(key, "$ENV:OPENAI_API_KEY");
+            }
+            other => panic!("expected ApiKey, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_command_key_roundtrip_serialization() {
+        let cred = AuthCredential::ApiKey {
+            key: "$CMD:op read op://vault/openai/api-key --no-newline".to_string(),
+        };
+        let json = serde_json::to_string(&cred).expect("serialize");
+        let parsed: AuthCredential = serde_json::from_str(&json).expect("deserialize");
+        match parsed {
+            AuthCredential::ApiKey { key } => {
+                assert_eq!(key, "$CMD:op read op://vault/openai/api-key --no-newline");
             }
             other => panic!("expected ApiKey, got {:?}", other),
         }

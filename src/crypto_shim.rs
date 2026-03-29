@@ -81,14 +81,15 @@ fn register_hmac_hostcall(global: &rquickjs::Object<'_>) -> rquickjs::Result<()>
                 let key_bytes = key
                     .as_bytes()
                     .ok_or_else(|| rquickjs::Error::new_from_js("buffer", "Detached key buffer"))?;
-                let data_bytes = data
-                    .as_bytes()
-                    .ok_or_else(|| rquickjs::Error::new_from_js("buffer", "Detached data buffer"))?;
+                let data_bytes = data.as_bytes().ok_or_else(|| {
+                    rquickjs::Error::new_from_js("buffer", "Detached data buffer")
+                })?;
                 let hash_bytes = match algorithm.as_str() {
                     "sha256" => {
-                        let mut mac = hmac::Hmac::<Sha256>::new_from_slice(key_bytes).map_err(
-                            |_| rquickjs::Error::new_from_js("key", "invalid HMAC key length"),
-                        )?;
+                        let mut mac =
+                            hmac::Hmac::<Sha256>::new_from_slice(key_bytes).map_err(|_| {
+                                rquickjs::Error::new_from_js("key", "invalid HMAC key length")
+                            })?;
                         mac.update(data_bytes);
                         mac.finalize().into_bytes().to_vec()
                     }
@@ -101,16 +102,16 @@ fn register_hmac_hostcall(global: &rquickjs::Object<'_>) -> rquickjs::Result<()>
                         mac.finalize().into_bytes().to_vec()
                     }
                     "sha1" => {
-                        let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(key_bytes)
-                            .map_err(|_| {
+                        let mut mac =
+                            hmac::Hmac::<sha1::Sha1>::new_from_slice(key_bytes).map_err(|_| {
                                 rquickjs::Error::new_from_js("key", "invalid HMAC key length")
                             })?;
                         mac.update(data_bytes);
                         mac.finalize().into_bytes().to_vec()
                     }
                     "md5" => {
-                        let mut mac = hmac::Hmac::<md5::Md5>::new_from_slice(key_bytes)
-                            .map_err(|_| {
+                        let mut mac =
+                            hmac::Hmac::<md5::Md5>::new_from_slice(key_bytes).map_err(|_| {
                                 rquickjs::Error::new_from_js("key", "invalid HMAC key length")
                             })?;
                         mac.update(data_bytes);

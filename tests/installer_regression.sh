@@ -59,6 +59,20 @@ STUB
   chmod +x "${dir}/fakebin/pi"
 }
 
+write_existing_rpi_stub() {
+  local dir="$1"
+  cat > "${dir}/fakebin/rpi" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "--version" ]; then
+  echo "rpi 1.2.3 (existing-stub)"
+  exit 0
+fi
+echo "existing rpi stub"
+STUB
+  chmod +x "${dir}/fakebin/rpi"
+}
+
 write_cosign_stub() {
   local dir="$1"
   local mode="$2"
@@ -111,6 +125,31 @@ fi
 /usr/bin/uname "\$@"
 EOF
   chmod +x "${dir}/fakebin/uname"
+}
+
+write_sysctl_stub() {
+  local dir="$1"
+  local arm64_capable="$2"
+  local translated="${3:-0}"
+  cat > "${dir}/fakebin/sysctl" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "\${1:-}" = "-in" ] || [ "\${1:-}" = "-n" ]; then
+  key="\${2:-}"
+  case "\$key" in
+    hw.optional.arm64)
+      echo "${arm64_capable}"
+      exit 0
+      ;;
+    sysctl.proc_translated)
+      echo "${translated}"
+      exit 0
+      ;;
+  esac
+fi
+/usr/sbin/sysctl "\$@"
+EOF
+  chmod +x "${dir}/fakebin/sysctl"
 }
 
 write_timeout_unusable_stubs() {
@@ -627,6 +666,38 @@ test_linux_target_uses_supported_linux_artifact_naming() {
   fi
 }
 
+test_rosetta_prefers_arm64_artifact_naming() {
+  local dir artifact checksum curl_log
+  dir="$(case_dir "rosetta-prefers-arm64")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Darwin" "x86_64"
+  write_sysctl_stub "$dir" "1" "1"
+  write_curl_artifact_stub "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  checksum="$(sha256_file "$artifact")"
+  curl_log="${dir}/curl.log"
+
+  STUB_ARTIFACT_SOURCE="$artifact" \
+  CURL_LOG_PATH="$curl_log" \
+  run_installer "$dir" \
+    --yes --no-gum \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --checksum "$checksum" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Rosetta shell detected on Apple Silicon; preferring native arm64 binary"
+  if ! grep -Eq "pi_darwin_arm64|aarch64-apple-darwin|pi-darwin-arm64" "$curl_log"; then
+    echo "expected darwin arm64 artifact URL candidate under Rosetta" >&2
+    cat "$curl_log" >&2
+    return 1
+  fi
+}
+
 test_wsl_detection_warning_is_emitted() {
   local dir artifact artifact_url checksum
   dir="$(case_dir "wsl-detection-warning")"
@@ -649,6 +720,71 @@ test_wsl_detection_warning_is_emitted() {
 
   assert_exit_code "$dir" 0
   assert_output_contains "$dir" "WSL detected"
+}
+
+test_installer_creates_rpi_alias_when_available() {
+  local dir artifact artifact_url checksum install_bin compat_alias
+  dir="$(case_dir "installer-creates-rpi-alias")"
+  write_existing_pi_stub "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+  install_bin="${dir}/dest/pi"
+  compat_alias="${dir}/dest/rpi"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Alias:     installed (rpi -> ${install_bin})"
+  [ -x "$install_bin" ] || { echo "expected installed binary at ${install_bin}" >&2; return 1; }
+  [ -x "$compat_alias" ] || { echo "expected compatibility alias at ${compat_alias}" >&2; return 1; }
+  grep -Fq "pi_agent_rust installer managed alias" "$compat_alias" || {
+    echo "expected managed alias marker in ${compat_alias}" >&2
+    return 1
+  }
+  "${compat_alias}" --version | grep -Fq "pi 9.9.9 (fixture)" || {
+    echo "expected compatibility alias to execute installed pi binary" >&2
+    return 1
+  }
+}
+
+test_installer_skips_rpi_alias_when_existing_command_present() {
+  local dir artifact artifact_url checksum compat_alias
+  dir="$(case_dir "installer-skips-rpi-alias-conflict")"
+  write_existing_pi_stub "$dir"
+  write_existing_rpi_stub "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+  compat_alias="${dir}/dest/rpi"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Existing rpi command detected at ${dir}/fakebin/rpi; skipping managed alias"
+  assert_output_contains "$dir" "Alias:     skipped (existing rpi command at ${dir}/fakebin/rpi)"
+  [ ! -e "$compat_alias" ] || {
+    echo "installer should not create rpi alias when another rpi command already exists" >&2
+    return 1
+  }
 }
 
 test_legacy_agent_settings_cleanup_is_safe_and_idempotent() {
@@ -1080,6 +1216,37 @@ SKILL
   fi
   if [ ! -f "${dir}/home/.codex/skills/pi-agent-rust/SKILL.md" ]; then
     echo "custom Codex skill directory should be preserved" >&2
+    return 1
+  fi
+}
+
+test_uninstall_removes_recorded_rpi_alias() {
+  local dir state_dir state_file alias_path
+  dir="$(case_dir "uninstall-removes-rpi-alias")"
+  state_dir="${dir}/state/pi-agent-rust"
+  state_file="${state_dir}/install-state.env"
+  alias_path="${dir}/home/.local/bin/rpi"
+  mkdir -p "${state_dir}" "$(dirname "$alias_path")"
+
+  cat > "$alias_path" <<'ALIAS'
+#!/usr/bin/env bash
+# pi_agent_rust installer managed alias
+set -euo pipefail
+exec /tmp/pi "$@"
+ALIAS
+  chmod +x "$alias_path"
+
+  cat > "$state_file" <<EOF
+PIAR_COMPAT_ALIAS_PATH=${alias_path}
+PIAR_COMPAT_ALIAS_STATUS='installed (rpi -> /tmp/pi)'
+EOF
+
+  run_uninstaller "$dir" --yes --no-gum
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Removed compatibility alias: ${alias_path}"
+  if [ -e "$alias_path" ]; then
+    echo "expected recorded compatibility alias to be removed" >&2
     return 1
   fi
 }
@@ -1650,7 +1817,10 @@ main() {
   run_test test_offline_relative_tarball_path_is_accepted
   run_test test_proxy_args_are_applied_to_curl_downloads
   run_test test_linux_target_uses_supported_linux_artifact_naming
+  run_test test_rosetta_prefers_arm64_artifact_naming
   run_test test_wsl_detection_warning_is_emitted
+  run_test test_installer_creates_rpi_alias_when_available
+  run_test test_installer_skips_rpi_alias_when_existing_command_present
   run_test test_legacy_agent_settings_cleanup_is_safe_and_idempotent
   run_test test_legacy_cleanup_skips_unexpected_settings_paths
   run_test test_agent_skills_install_by_default
@@ -1660,6 +1830,7 @@ main() {
   run_test test_skill_copy_failure_preserves_existing_managed_skills
   run_test test_skill_custom_plus_copy_failure_reports_partial
   run_test test_uninstall_removes_only_installer_managed_skills
+  run_test test_uninstall_removes_recorded_rpi_alias
   run_test test_uninstall_cleans_legacy_agent_settings_hooks
   run_test test_uninstall_uses_recorded_skill_paths
   run_test test_uninstall_skips_unexpected_skill_paths

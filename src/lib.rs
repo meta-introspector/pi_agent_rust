@@ -101,9 +101,9 @@ pub mod models;
 pub mod package_manager;
 pub mod perf_build;
 pub mod permissions;
-pub mod platform;
 #[cfg(feature = "wasm-host")]
 pub mod pi_wasm;
+pub mod platform;
 pub mod provider;
 pub mod provider_metadata;
 pub mod providers;

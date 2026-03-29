@@ -293,6 +293,7 @@ pub struct SessionOptions {
     pub extension_paths: Vec<PathBuf>,
     pub extension_policy: Option<String>,
     pub repair_policy: Option<String>,
+    pub include_cwd_in_prompt: bool,
     pub max_tool_iterations: usize,
 
     /// Session-level event listener invoked for every [`AgentEvent`].
@@ -328,6 +329,7 @@ impl Default for SessionOptions {
             extension_paths: Vec::new(),
             extension_policy: None,
             repair_policy: None,
+            include_cwd_in_prompt: true,
             max_tool_iterations: 50,
             on_event: None,
             on_tool_start: None,
@@ -1563,6 +1565,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     cli.api_key = options.api_key.clone();
     cli.system_prompt = options.system_prompt.clone();
     cli.append_system_prompt = options.append_system_prompt.clone();
+    cli.hide_cwd_in_prompt = !options.include_cwd_in_prompt;
     cli.thinking = options.thinking.map(|t| t.to_string());
     cli.session = options
         .session_path
@@ -1632,7 +1635,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         &global_dir,
         &package_dir,
         std::env::var_os("PI_TEST_MODE").is_some(),
-        !cli.hide_cwd_in_prompt,
+        options.include_cwd_in_prompt,
     );
 
     let provider = providers::create_provider(&selection.model_entry, None)
