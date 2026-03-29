@@ -59,7 +59,20 @@ fn crypto_ext_source(js_expr: &str) -> String {
     format!(
         r#"
 import crypto from "node:crypto";
-const {{ createHash, createHmac, randomUUID, randomBytes, randomInt, timingSafeEqual, getHashes }} = crypto;
+const {{
+  createHash,
+  createHmac,
+  randomUUID,
+  randomBytes,
+  randomInt,
+  timingSafeEqual,
+  getHashes,
+  pbkdf2Sync,
+  pbkdf2,
+  scryptSync,
+  createCipheriv,
+  sign,
+}} = crypto;
 
 export default function activate(pi) {{
   pi.on("agent_start", (event, ctx) => {{
@@ -400,6 +413,175 @@ fn create_hmac_unsupported_encoding_throws() {
     assert!(
         result.contains("unsupported encoding"),
         "Expected unsupported-encoding error, got: {result}"
+    );
+}
+
+#[test]
+fn create_hash_second_digest_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        const hash = createHash("sha256").update("hello");
+        hash.digest("hex");
+        try {
+            hash.digest("hex");
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("digest() already called"),
+        "Expected repeated digest() to throw, got: {result}"
+    );
+}
+
+#[test]
+fn create_hash_update_after_digest_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        const hash = createHash("sha256").update("hello");
+        hash.digest("hex");
+        try {
+            hash.update("world");
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("digest() already called"),
+        "Expected update() after digest() to throw, got: {result}"
+    );
+}
+
+#[test]
+fn create_hmac_second_digest_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        const hmac = createHmac("sha256", "secret").update("hello");
+        hmac.digest("hex");
+        try {
+            hmac.digest("hex");
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("digest() already called"),
+        "Expected repeated HMAC digest() to throw, got: {result}"
+    );
+}
+
+#[test]
+fn create_hmac_update_after_digest_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        const hmac = createHmac("sha256", "secret").update("hello");
+        hmac.digest("hex");
+        try {
+            hmac.update("world");
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("digest() already called"),
+        "Expected HMAC update() after digest() to throw, got: {result}"
+    );
+}
+
+#[test]
+fn pbkdf2_sync_unimplemented_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        try {
+            pbkdf2Sync("password", "salt", 1000, 16, "sha256");
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("pbkdf2Sync is not implemented"),
+        "Expected pbkdf2Sync to fail loudly, got: {result}"
+    );
+}
+
+#[test]
+fn pbkdf2_async_unimplemented_reports_error() {
+    let result = eval_crypto(
+        r#"(() => {
+        let outcome = "no-callback";
+        pbkdf2("password", "salt", 1000, 16, "sha256", (err, value) => {
+            outcome = err ? "threw:" + err.message : "ok:" + value;
+        });
+        return outcome;
+    })()"#,
+    );
+    assert!(
+        result.contains("pbkdf2 is not implemented"),
+        "Expected pbkdf2 callback to receive unsupported error, got: {result}"
+    );
+}
+
+#[test]
+fn scrypt_sync_unimplemented_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        try {
+            scryptSync("password", "salt", 16);
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("scryptSync is not implemented"),
+        "Expected scryptSync to fail loudly, got: {result}"
+    );
+}
+
+#[test]
+fn create_cipheriv_unimplemented_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        try {
+            createCipheriv("aes-256-gcm", randomBytes(32), randomBytes(16));
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("createCipheriv is not implemented"),
+        "Expected createCipheriv to fail loudly, got: {result}"
+    );
+}
+
+#[test]
+fn sign_unimplemented_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        try {
+            sign("sha256", new Uint8Array([1, 2, 3]), {});
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("sign is not implemented"),
+        "Expected sign() to fail loudly, got: {result}"
     );
 }
 

@@ -335,6 +335,10 @@ function toUint8Array(input) {
   return new TextEncoder().encode(String(input ?? ''));
 }
 
+function unsupportedCryptoApi(name) {
+  throw new Error(`${name} is not implemented in the Pi node:crypto shim`);
+}
+
 export function randomUUID() {
   const randomUuidNative = requireCryptoHostcall(
     '__pi_crypto_random_uuid_native',
@@ -345,12 +349,20 @@ export function randomUUID() {
 
 export function createHash(algorithm) {
   const chunks = [];
+  let finalized = false;
   return {
     update(input) {
+      if (finalized) {
+        throw new Error('Hash.digest() already called');
+      }
       chunks.push(toUint8Array(input));
       return this;
     },
     digest(encoding) {
+      if (finalized) {
+        throw new Error('Hash.digest() already called');
+      }
+      finalized = true;
       const hashNative = requireCryptoHostcall('__pi_crypto_hash_native', 'createHash');
       const data = combineChunks(chunks);
       const hex = hashNative(algorithm, data, 'hex');
@@ -368,12 +380,20 @@ export function createHash(algorithm) {
 export function createHmac(algorithm, key) {
   const chunks = [];
   const keyBuf = toUint8Array(key);
+  let finalized = false;
   return {
     update(input) {
+      if (finalized) {
+        throw new Error('Hmac.digest() already called');
+      }
       chunks.push(toUint8Array(input));
       return this;
     },
     digest(encoding) {
+      if (finalized) {
+        throw new Error('Hmac.digest() already called');
+      }
+      finalized = true;
       const hmacNative = requireCryptoHostcall('__pi_crypto_hmac_native', 'createHmac');
       const data = combineChunks(chunks);
       const hex = hmacNative(algorithm, keyBuf, data, 'hex');
@@ -427,59 +447,43 @@ export function getHashes() {
 }
 
 export function pbkdf2Sync(password, salt, iterations, keylen, digest) {
-  // Stub: returns a buffer of the requested length filled with deterministic
-  // bytes derived from the inputs.  Real PBKDF2 requires a native hostcall
-  // (not yet implemented), so this is a best-effort placeholder.
-  const out = new Uint8Array(keylen);
-  const pw = typeof password  === 'string' ? password : '';
-  const sl = typeof salt === 'string' ? salt : '';
-  const seed = pw + sl + String(iterations);
-  let h = 0;
-  for (let i = 0; i < seed.length; i++) { h = ((h << 5) - h + seed.charCodeAt(i)) | 0; }
-  for (let i = 0; i < keylen; i++) { h = ((h * 1103515245) + 12345) | 0; out[i] = (h >>> 16) & 0xff; }
-  return { toString(enc) { return Array.from(out, b => b.toString(16).padStart(2, '0')).join(''); } };
+  unsupportedCryptoApi('pbkdf2Sync');
 }
 
 export function pbkdf2(password, salt, iterations, keylen, digest, callback) {
-  try { callback(null, pbkdf2Sync(password, salt, iterations, keylen, digest)); }
-  catch (e) { callback(e); }
+  try {
+    callback(unsupportedCryptoApi('pbkdf2'));
+  } catch (e) {
+    callback(e);
+  }
 }
 
 export function createCipheriv(algorithm, key, iv) {
-  let buf = new Uint8Array();
-  return {
-    update(data, inputEnc, outputEnc) { buf = typeof data === 'string' ? new TextEncoder().encode(data) : data; return buf; },
-    final(outputEnc) { return new Uint8Array(0); },
-    setAutoPadding() { return this; },
-    getAuthTag() { return new Uint8Array(16); },
-  };
+  unsupportedCryptoApi('createCipheriv');
 }
 
 export function createDecipheriv(algorithm, key, iv) {
-  let buf = new Uint8Array();
-  return {
-    update(data, inputEnc, outputEnc) { buf = typeof data === 'string' ? new TextEncoder().encode(data) : data; return buf; },
-    final(outputEnc) { return new Uint8Array(0); },
-    setAutoPadding() { return this; },
-    setAuthTag() { return this; },
-  };
+  unsupportedCryptoApi('createDecipheriv');
 }
 
 export function scryptSync(password, salt, keylen) {
-  return pbkdf2Sync(password, salt, 1, keylen, 'sha256');
+  unsupportedCryptoApi('scryptSync');
 }
 
 export function scrypt(password, salt, keylen, options, callback) {
   if (typeof options === 'function') { callback = options; }
-  try { callback(null, scryptSync(password, salt, keylen)); }
-  catch (e) { callback(e); }
+  try {
+    callback(unsupportedCryptoApi('scrypt'));
+  } catch (e) {
+    callback(e);
+  }
 }
 
-export function generateKeyPairSync() { return { publicKey: '', privateKey: '' }; }
-export function publicEncrypt() { return new Uint8Array(); }
-export function privateDecrypt() { return new Uint8Array(); }
-export function sign() { return new Uint8Array(); }
-export function verify() { return false; }
+export function generateKeyPairSync() { unsupportedCryptoApi('generateKeyPairSync'); }
+export function publicEncrypt() { unsupportedCryptoApi('publicEncrypt'); }
+export function privateDecrypt() { unsupportedCryptoApi('privateDecrypt'); }
+export function sign() { unsupportedCryptoApi('sign'); }
+export function verify() { unsupportedCryptoApi('verify'); }
 
 export default {
   randomUUID, createHash, createHmac, randomBytes,

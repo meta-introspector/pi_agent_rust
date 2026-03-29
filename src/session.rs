@@ -56,16 +56,19 @@ fn save_jsonl_full_rewrite_blocking(
     sessions_root: &Path,
     header: &SessionHeader,
     entries: &[SessionEntry],
-    message_count: u64,
-    session_name: Option<String>,
-) -> Result<()> {
+    persisted_entry_count: usize,
+    header_dirty: bool,
+) -> Result<(SessionHeader, Vec<SessionEntry>)> {
+    let _lock = lock_session_persistence(path)?;
+    let (header_to_write, entries_to_write) =
+        prepare_jsonl_full_rewrite(path, header, entries, persisted_entry_count, header_dirty)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let temp_file = tempfile::NamedTempFile::new_in(parent)?;
     {
         let mut writer = std::io::BufWriter::with_capacity(1 << 20, temp_file.as_file());
-        serde_json::to_writer(&mut writer, header)?;
+        serde_json::to_writer(&mut writer, &header_to_write)?;
         writer.write_all(b"\n")?;
-        for entry in entries {
+        for entry in &entries_to_write {
             serde_json::to_writer(&mut writer, entry)?;
             writer.write_all(b"\n")?;
         }
@@ -74,9 +77,18 @@ fn save_jsonl_full_rewrite_blocking(
     temp_file
         .persist(path)
         .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
-
-    enqueue_session_index_snapshot_update(sessions_root, path, header, message_count, session_name);
-    Ok(())
+    let mut entries_for_stats = entries_to_write.clone();
+    let finalized = finalize_loaded_entries(&mut entries_for_stats);
+    let message_count = finalized.message_count;
+    let session_name = finalized.name;
+    enqueue_session_index_snapshot_update(
+        sessions_root,
+        path,
+        &header_to_write,
+        message_count,
+        session_name,
+    );
+    Ok((header_to_write, entries_to_write))
 }
 
 fn append_jsonl_entries_blocking(
@@ -87,17 +99,99 @@ fn append_jsonl_entries_blocking(
     message_count: u64,
     session_name: Option<String>,
 ) -> Result<()> {
+    let _lock = lock_session_persistence(path)?;
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(path)
         .map_err(|e| crate::Error::Io(Box::new(e)))?;
-
-    file.lock_exclusive()?;
     file.write_all(serialized_entries)?;
-    FileExt::unlock(&file)?;
 
     enqueue_session_index_snapshot_update(sessions_root, path, header, message_count, session_name);
     Ok(())
+}
+
+fn session_persistence_lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    PathBuf::from(lock_path)
+}
+
+fn lock_session_persistence(path: &Path) -> Result<SessionPersistenceLockGuard> {
+    let lock_path = session_persistence_lock_path(path);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| crate::Error::Io(Box::new(e)))?;
+    file.lock_exclusive()?;
+    Ok(SessionPersistenceLockGuard { file })
+}
+
+#[derive(Debug)]
+struct SessionPersistenceLockGuard {
+    file: std::fs::File,
+}
+
+impl Drop for SessionPersistenceLockGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn prepare_jsonl_full_rewrite(
+    path: &Path,
+    header: &SessionHeader,
+    entries: &[SessionEntry],
+    persisted_entry_count: usize,
+    header_dirty: bool,
+) -> Result<(SessionHeader, Vec<SessionEntry>)> {
+    let pending_start = persisted_entry_count.min(entries.len());
+    let mut merged_entries = entries[..pending_start].to_vec();
+    let local_pending = &entries[pending_start..];
+    let mut header_to_write = header.clone();
+
+    if path
+        .try_exists()
+        .map_err(|e| crate::Error::Io(Box::new(e)))?
+    {
+        let (disk_session, _) = open_jsonl_blocking(path.to_path_buf())?;
+        if !header_dirty {
+            header_to_write = disk_session.header;
+        }
+
+        let known_ids: HashSet<&str> = entries
+            .iter()
+            .filter_map(|entry| entry.base_id().map(String::as_str))
+            .collect();
+
+        for disk_entry in disk_session.entries.into_iter().skip(pending_start) {
+            let should_merge = disk_entry
+                .base_id()
+                .is_none_or(|id| !known_ids.contains(id.as_str()));
+            if should_merge {
+                merged_entries.push(disk_entry);
+            }
+        }
+    }
+
+    merged_entries.extend_from_slice(local_pending);
+    Ok((header_to_write, merged_entries))
+}
+
+fn total_v2_message_count(store: &SessionStoreV2) -> Result<Option<u64>> {
+    if let Some(manifest) = store.read_manifest()? {
+        return Ok(Some(manifest.counters.messages_total));
+    }
+
+    let mut total = 0u64;
+    for frame in store.read_all_entries()? {
+        if frame.entry_type == "message" {
+            total = total.saturating_add(1);
+        }
+    }
+    Ok(Some(total))
 }
 
 /// Handle to a thread-safe shared session.
@@ -874,6 +968,9 @@ impl Session {
 
         if let Some(path) = &cli.session {
             let mut session = Self::open(path).await?;
+            session.session_dir = session_dir
+                .clone()
+                .or_else(|| infer_session_root_from_path(Path::new(path)));
             session.set_autosave_durability_mode(durability_mode);
             return Ok(session);
         }
@@ -1266,9 +1363,8 @@ impl Session {
         }
 
         let mut v2_message_count_offset = 0;
-        if matches!(mode, V2OpenMode::Tail(_)) {
-            if let Ok(Some(manifest)) = store.read_manifest() {
-                let total = manifest.counters.messages_total;
+        if matches!(mode, V2OpenMode::Tail(_) | V2OpenMode::ActivePath) {
+            if let Ok(Some(total)) = total_v2_message_count(store) {
                 let loaded = finalized.message_count;
                 v2_message_count_offset = total.saturating_sub(loaded);
             }
@@ -1746,27 +1842,40 @@ impl Session {
                         self.ensure_full_v2_hydration_before_save()?;
                     }
                     // Gap C: use incrementally maintained stats instead of O(n) scan.
-                    let message_count = self.cached_message_count;
-
-                    let session_name = self.cached_name.clone();
                     // === Full rewrite path (first save, header change, checkpoint) ===
                     let header_snapshot = self.header.clone();
                     let entries_to_save = self.entries.clone();
+                    let persisted_entry_count = self.persisted_entry_count.load(Ordering::SeqCst);
+                    let header_dirty = self.header_dirty;
                     let path_for_task = path_clone.clone();
                     let sessions_root_for_task = sessions_root.clone();
-                    asupersync::runtime::spawn_blocking(move || {
-                        save_jsonl_full_rewrite_blocking(
-                            &path_for_task,
-                            &sessions_root_for_task,
-                            &header_snapshot,
-                            &entries_to_save,
-                            message_count,
-                            session_name,
-                        )
-                    })
-                    .await?;
+                    let (saved_header, saved_entries) =
+                        asupersync::runtime::spawn_blocking(move || {
+                            save_jsonl_full_rewrite_blocking(
+                                &path_for_task,
+                                &sessions_root_for_task,
+                                &header_snapshot,
+                                &entries_to_save,
+                                persisted_entry_count,
+                                header_dirty,
+                            )
+                        })
+                        .await?;
 
-                    // Keep derived caches as-is: save path does not mutate entry ordering/content.
+                    let previous_leaf = self.leaf_id.clone();
+                    self.header = saved_header;
+                    self.entries = saved_entries;
+                    let finalized = finalize_loaded_entries(&mut self.entries);
+                    self.entry_ids = finalized.entry_ids;
+                    self.entry_index = finalized.entry_index;
+                    self.cached_message_count = finalized
+                        .message_count
+                        .saturating_add(self.v2_message_count_offset);
+                    self.cached_name = finalized.name;
+                    self.leaf_id = previous_leaf
+                        .filter(|id| self.entry_index.contains_key(id))
+                        .or_else(|| finalized.leaf_id.clone());
+                    self.is_linear = finalized.is_linear && self.leaf_id == finalized.leaf_id;
                     self.persisted_entry_count
                         .store(self.entries.len(), Ordering::SeqCst);
                     self.header_dirty = false;
@@ -3357,6 +3466,18 @@ pub fn encode_cwd(path: &std::path::Path) -> String {
     format!("--{s}--")
 }
 
+fn infer_session_root_from_path(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?.to_path_buf();
+    if parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("--") && name.ends_with("--") && name.len() > 4)
+    {
+        return parent.parent().map(PathBuf::from).or(Some(parent));
+    }
+    Some(parent)
+}
+
 pub(crate) fn session_message_to_model(message: &SessionMessage) -> Option<Message> {
     match message {
         SessionMessage::User { content, timestamp } => Some(Message::User(UserMessage {
@@ -4122,6 +4243,8 @@ fn build_v2_sidecar_from_jsonl_into(jsonl_path: &Path, v2_root: &Path) -> Result
             store.append_entry(entry_id, parent_entry_id, entry_type, payload)?;
         }
 
+        store.write_manifest(header.id, "jsonl")?;
+
         Ok(store)
     })();
 
@@ -4857,6 +4980,14 @@ mod tests {
             "active path intentionally excludes non-leaf sibling branch"
         );
         assert!(active_ids.contains(&id_c));
+        assert_eq!(
+            loaded.cached_message_count, seed.cached_message_count,
+            "active-path resume should retain total message count metadata"
+        );
+        assert!(
+            loaded.v2_message_count_offset > 0,
+            "active-path resume should track hidden messages outside the active path"
+        );
 
         // Force full rewrite path (header dirty). Save must rehydrate first so b survives.
         loaded.set_model_header(Some("provider-updated".to_string()), None, None);
@@ -9002,6 +9133,61 @@ mod tests {
         let loaded =
             run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
         assert_eq!(loaded.entries.len(), 2);
+    }
+
+    #[test]
+    fn full_rewrite_preserves_entries_appended_by_other_writer() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("original"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let mut stale_rewriter =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+        let mut appender =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        appender.append_message(make_test_message("from appender"));
+        run_async(async { appender.save().await }).unwrap();
+
+        stale_rewriter.set_model_header(Some("new-provider".to_string()), None, None);
+        run_async(async { stale_rewriter.save().await }).unwrap();
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+        let entry_texts = loaded
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                SessionEntry::Message(message) => match &message.message {
+                    SessionMessage::User { content, .. } => match content {
+                        UserContent::Text(text) => Some(text.clone()),
+                        UserContent::Blocks(_) => None,
+                    },
+                    SessionMessage::Assistant { message } => {
+                        message.content.iter().find_map(|block| match block {
+                            ContentBlock::Text(TextContent { text, .. }) => Some(text.clone()),
+                            _ => None,
+                        })
+                    }
+                    SessionMessage::ToolResult { .. } => None,
+                    SessionMessage::Custom { .. } => None,
+                    SessionMessage::BashExecution { .. } => None,
+                    SessionMessage::BranchSummary { .. } => None,
+                    SessionMessage::CompactionSummary { .. } => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            entry_texts.iter().any(|text| text == "from appender"),
+            "full rewrite should preserve entries appended after this session was opened"
+        );
+        assert_eq!(loaded.header.provider.as_deref(), Some("new-provider"));
     }
 
     #[test]

@@ -25,6 +25,7 @@ use pi::provider::{Context, Provider, StreamOptions};
 #[cfg(unix)]
 use pi::session::encode_cwd;
 use pi::session::{Session, SessionEntry, SessionMessage, SessionStoreKind};
+use pi::session_index::SessionIndex;
 use pi::tools::ToolRegistry;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
@@ -1127,6 +1128,99 @@ fn explicit_session_flag_loads_requested_session() {
         assert!(
             contains_user_message,
             "explicitly loaded session missing expected user message"
+        );
+    });
+
+    write_jsonl_artifacts(&harness, test_name);
+}
+
+#[test]
+fn explicit_session_flag_preserves_custom_session_root_for_index_updates() {
+    let test_name = "e2e_explicit_session_flag_preserves_custom_session_root_for_index_updates";
+    let harness = TestHarness::new(test_name);
+
+    run_async_test(async {
+        let custom_root = harness.temp_path("custom-root");
+        let session_dir = custom_root.join(pi::session::encode_cwd(
+            &std::env::current_dir().expect("current dir"),
+        ));
+        let session_path = session_dir.join("session.jsonl");
+        write_minimal_session(
+            &session_path,
+            harness.temp_dir(),
+            "session-explicit-custom-root",
+            "explicit session payload",
+        );
+
+        let session_arg = session_path.to_string_lossy().to_string();
+        let session_dir_arg = custom_root.to_string_lossy().to_string();
+        let cli = Cli::parse_from([
+            "pi",
+            "--session",
+            session_arg.as_str(),
+            "--session-dir",
+            session_dir_arg.as_str(),
+        ]);
+
+        let mut loaded = Session::new(&cli, &Config::default())
+            .await
+            .expect("load explicit session");
+        loaded.append_message(SessionMessage::User {
+            content: UserContent::Text("after explicit load".to_string()),
+            timestamp: None,
+        });
+        loaded.save().await.expect("save explicit session");
+
+        let indexed = SessionIndex::for_sessions_root(&custom_root)
+            .list_sessions(None)
+            .expect("list indexed sessions");
+        assert!(
+            indexed
+                .into_iter()
+                .any(|meta| meta.path == session_path.display().to_string()),
+            "expected explicit session save to update the custom session root index",
+        );
+    });
+
+    write_jsonl_artifacts(&harness, test_name);
+}
+
+#[test]
+fn explicit_session_flag_infers_custom_session_root_from_session_path() {
+    let test_name = "e2e_explicit_session_flag_infers_custom_session_root_from_session_path";
+    let harness = TestHarness::new(test_name);
+
+    run_async_test(async {
+        let custom_root = harness.temp_path("custom-root");
+        let session_dir = custom_root.join("--other-project--");
+        let session_path = session_dir.join("session.jsonl");
+        write_minimal_session(
+            &session_path,
+            harness.temp_dir(),
+            "session-explicit-inferred-root",
+            "explicit inferred root payload",
+        );
+
+        let session_arg = session_path.to_string_lossy().to_string();
+        let cli = Cli::parse_from(["pi", "--session", session_arg.as_str()]);
+
+        let mut loaded = Session::new(&cli, &Config::default())
+            .await
+            .expect("load explicit session");
+        loaded.append_message(SessionMessage::User {
+            content: UserContent::Text("after inferred explicit load".to_string()),
+            timestamp: None,
+        });
+        loaded.save().await.expect("save explicit session");
+
+        let indexed = SessionIndex::for_sessions_root(&custom_root)
+            .list_sessions(None)
+            .expect("list indexed sessions");
+        assert!(
+            indexed
+                .into_iter()
+                .any(|meta| meta.path == session_path.display().to_string()),
+            "expected explicit session save to update the inferred custom session root index",
         );
     });
 
