@@ -4,7 +4,7 @@ use crate::session_metrics;
 use sqlmodel_core::{Error as SqliteError, Row as SqliteRow, Value as SqliteValue};
 use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const INIT_SQL: &str = r"
 PRAGMA journal_mode = WAL;
@@ -57,6 +57,78 @@ fn rollback_quietly(conn: &SqliteConnection) {
     let _ = conn.execute_raw("ROLLBACK");
 }
 
+fn sqlite_artifact_paths(path: &Path) -> [PathBuf; 3] {
+    [
+        path.to_path_buf(),
+        append_sidecar_suffix(path, "-wal"),
+        append_sidecar_suffix(path, "-shm"),
+    ]
+}
+
+fn append_sidecar_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
+#[cfg(unix)]
+fn set_private_permissions_if_present(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if path.try_exists().map_err(|err| Error::Io(Box::new(err)))? {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|err| {
+            Error::session(format!(
+                "Failed to secure SQLite session artifact {}: {err}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions_if_present(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn ensure_private_sqlite_permissions(path: &Path) -> Result<()> {
+    for artifact in sqlite_artifact_paths(path) {
+        set_private_permissions_if_present(&artifact)?;
+    }
+    Ok(())
+}
+
+fn read_all_entries(conn: &SqliteConnection) -> Result<Vec<SessionEntry>> {
+    let entry_rows = map_sqlite_result(
+        conn.query_sync("SELECT json FROM pi_session_entries ORDER BY seq ASC", &[]),
+    )?;
+
+    let mut entries = Vec::with_capacity(entry_rows.len());
+    for row in entry_rows {
+        let json = row_get_string(&row, "json")?;
+        let entry: SessionEntry = serde_json::from_str(&json)?;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+fn is_missing_meta_table_error(err: &SqliteError) -> bool {
+    err.to_string().contains("no such table: pi_session_meta")
+}
+
+fn query_session_meta_rows(conn: &SqliteConnection) -> Result<Vec<SqliteRow>> {
+    match conn.query_sync(
+        "SELECT key,value FROM pi_session_meta WHERE key IN ('message_count','name')",
+        &[],
+    ) {
+        Ok(rows) => Ok(rows),
+        Err(err) if is_missing_meta_table_error(&err) => Ok(Vec::new()),
+        Err(err) => Err(Error::session(format!(
+            "SQLite session meta query failed: {err}"
+        ))),
+    }
+}
+
 fn compute_message_count_and_name(entries: &[SessionEntry]) -> (u64, Option<String>) {
     let mut message_count = 0u64;
     let mut name = None;
@@ -97,16 +169,7 @@ pub async fn load_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntr
         .validate()
         .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
 
-    let entry_rows = map_sqlite_result(
-        conn.query_sync("SELECT json FROM pi_session_entries ORDER BY seq ASC", &[]),
-    )?;
-
-    let mut entries = Vec::with_capacity(entry_rows.len());
-    for row in entry_rows {
-        let json = row_get_string(&row, "json")?;
-        let entry: SessionEntry = serde_json::from_str(&json)?;
-        entries.push(entry);
-    }
+    let entries = read_all_entries(&conn)?;
 
     Ok((header, entries))
 }
@@ -134,12 +197,7 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
         .validate()
         .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
 
-    let meta_rows = conn
-        .query_sync(
-            "SELECT key,value FROM pi_session_meta WHERE key IN ('message_count','name')",
-            &[],
-        )
-        .unwrap_or_default();
+    let meta_rows = query_session_meta_rows(&conn)?;
 
     let mut message_count: Option<u64> = None;
     let mut name: Option<String> = None;
@@ -155,29 +213,20 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
         }
     }
 
-    let message_count = if let Some(message_count) = message_count {
-        message_count
-    } else {
-        let entry_rows = map_sqlite_result(
-            conn.query_sync("SELECT json FROM pi_session_entries ORDER BY seq ASC", &[]),
-        )?;
-
-        let mut entries = Vec::with_capacity(entry_rows.len());
-        for row in entry_rows {
-            let json = row_get_string(&row, "json")?;
-            let entry: SessionEntry = serde_json::from_str(&json)?;
-            entries.push(entry);
+    if message_count.is_none() || name.is_none() {
+        let entries = read_all_entries(&conn)?;
+        let (fallback_message_count, fallback_name) = compute_message_count_and_name(&entries);
+        if message_count.is_none() {
+            message_count = Some(fallback_message_count);
         }
-
-        let (message_count, fallback_name) = compute_message_count_and_name(&entries);
         if name.is_none() {
             name = fallback_name;
         }
-        message_count
-    };
+    }
+
     Ok(SqliteSessionMeta {
         header,
-        message_count,
+        message_count: message_count.unwrap_or(0),
         name,
     })
 }
@@ -538,6 +587,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn load_session_meta_falls_back_to_entries_when_name_row_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing-name-row.sqlite");
+        let header = SessionHeader {
+            id: "sqlite-name-fallback".to_string(),
+            ..SessionHeader::default()
+        };
+        let entries = vec![
+            session_info_entry(Some("Recovered Name".to_string())),
+            message_entry(),
+            message_entry(),
+        ];
+
+        futures::executor::block_on(async { save_session(&path, &header, &entries).await })
+            .expect("save sqlite session");
+
+        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
+            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
+        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
+        conn.execute_sync(
+            "DELETE FROM pi_session_meta WHERE key = ?1",
+            &[SqliteValue::Text("name".to_string())],
+        )
+        .expect("delete name meta row");
+
+        let meta = futures::executor::block_on(async { load_session_meta(&path).await })
+            .expect("load sqlite meta");
+        assert_eq!(meta.message_count, 2);
+        assert_eq!(meta.name.as_deref(), Some("Recovered Name"));
+    }
+
+    #[test]
+    fn load_session_meta_falls_back_when_meta_table_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing-meta-table.sqlite");
+        let header = SessionHeader {
+            id: "sqlite-missing-meta".to_string(),
+            ..SessionHeader::default()
+        };
+        let entries = vec![
+            session_info_entry(Some("Recovered From Entries".to_string())),
+            message_entry(),
+        ];
+
+        futures::executor::block_on(async { save_session(&path, &header, &entries).await })
+            .expect("save sqlite session");
+
+        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
+            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
+        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
+        conn.execute_raw("DROP TABLE pi_session_meta")
+            .expect("drop sqlite meta table");
+
+        let meta = futures::executor::block_on(async { load_session_meta(&path).await })
+            .expect("load sqlite meta");
+        assert_eq!(meta.message_count, 1);
+        assert_eq!(meta.name.as_deref(), Some("Recovered From Entries"));
+    }
+
+    #[test]
+    fn load_session_meta_rejects_invalid_meta_table_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("invalid-meta-schema.sqlite");
+        let header = SessionHeader {
+            id: "sqlite-invalid-meta-schema".to_string(),
+            ..SessionHeader::default()
+        };
+
+        futures::executor::block_on(async {
+            save_session(&path, &header, &[message_entry()]).await
+        })
+        .expect("save sqlite session");
+
+        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
+            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
+        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
+        conn.execute_raw("DROP TABLE pi_session_meta")
+            .expect("drop sqlite meta table");
+        conn.execute_raw("CREATE TABLE pi_session_meta (key TEXT PRIMARY KEY)")
+            .expect("create invalid sqlite meta table");
+
+        let err = futures::executor::block_on(async { load_session_meta(&path).await })
+            .expect_err("invalid meta schema should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("SQLite session meta query failed"),
+            "expected meta query error, got {message}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn load_paths_accept_read_only_sqlite_files() {
@@ -579,6 +719,40 @@ mod tests {
         assert_eq!(meta.message_count, 1);
         assert_eq!(meta.name.as_deref(), Some("Read Only"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_session_sets_private_permissions_for_sqlite_artifacts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("secure.sqlite");
+        let header = SessionHeader {
+            id: "sqlite-secure".to_string(),
+            ..SessionHeader::default()
+        };
+
+        futures::executor::block_on(async {
+            save_session(&path, &header, &[message_entry()]).await
+        })
+        .expect("save sqlite session");
+
+        for artifact in sqlite_artifact_paths(&path) {
+            if artifact.exists() {
+                let mode = std::fs::metadata(&artifact)
+                    .expect("sqlite artifact metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(
+                    mode,
+                    0o600,
+                    "expected private permissions for {}",
+                    artifact.display()
+                );
+            }
+        }
+    }
 }
 
 pub async fn save_session(
@@ -598,6 +772,7 @@ pub async fn save_session(
 
     let conn = open_sqlite_connection_read_write(path)?;
     map_sqlite_result(conn.execute_raw(INIT_SQL))?;
+    ensure_private_sqlite_permissions(path)?;
     map_sqlite_result(conn.execute_raw("BEGIN IMMEDIATE"))?;
 
     // Serialize header + entries and track serialization time + bytes.
@@ -667,6 +842,7 @@ pub async fn save_session(
     match save_result {
         Ok(()) => {
             map_sqlite_result(conn.execute_raw("COMMIT"))?;
+            ensure_private_sqlite_permissions(path)?;
             Ok(())
         }
         Err(err) => {
@@ -698,6 +874,7 @@ pub async fn append_entries(
 
     // Ensure WAL mode is active and tables exist (especially pi_session_meta for old DBs).
     map_sqlite_result(conn.execute_raw(INIT_SQL))?;
+    ensure_private_sqlite_permissions(path)?;
     map_sqlite_result(conn.execute_raw("BEGIN IMMEDIATE"))?;
 
     let append_result = (|| -> Result<()> {
@@ -755,6 +932,7 @@ pub async fn append_entries(
     match append_result {
         Ok(()) => {
             map_sqlite_result(conn.execute_raw("COMMIT"))?;
+            ensure_private_sqlite_permissions(path)?;
             Ok(())
         }
         Err(err) => {
