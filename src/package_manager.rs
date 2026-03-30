@@ -2100,30 +2100,38 @@ fn parse_manifest_entries_field(
     let Some(value) = obj.get(key) else {
         return Ok(None);
     };
-    let Some(arr) = value.as_array() else {
-        return Err(Error::config(format!(
-            "Invalid package manifest {}: `pi.{key}` must be an array of strings",
-            manifest_path.display()
-        )));
-    };
 
-    let mut out = Vec::with_capacity(arr.len());
-    for entry in arr {
-        let Some(entry) = entry.as_str() else {
-            return Err(Error::config(format!(
-                "Invalid package manifest {}: `pi.{key}` must be an array of strings",
-                manifest_path.display()
-            )));
-        };
-        out.push(validate_manifest_entry(
+    match value {
+        Value::String(entry) => Ok(Some(vec![validate_manifest_entry(
             package_root,
             manifest_path,
             key,
             entry,
-        )?);
-    }
+        )?])),
+        Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for entry in arr {
+                let Some(entry) = entry.as_str() else {
+                    return Err(Error::config(format!(
+                        "Invalid package manifest {}: `pi.{key}` must be a string or array of strings",
+                        manifest_path.display()
+                    )));
+                };
+                out.push(validate_manifest_entry(
+                    package_root,
+                    manifest_path,
+                    key,
+                    entry,
+                )?);
+            }
 
-    Ok(Some(out))
+            Ok(Some(out))
+        }
+        _ => Err(Error::config(format!(
+            "Invalid package manifest {}: `pi.{key}` must be a string or array of strings",
+            manifest_path.display()
+        ))),
+    }
 }
 
 fn validate_manifest_entry(
@@ -4565,6 +4573,48 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_extension_sources_accepts_single_string_manifest_extension() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let package_root = temp_dir.path().join("pkg");
+            let entry_path = package_root.join("extensions").join("index.ts");
+            fs::create_dir_all(entry_path.parent().expect("entry parent")).expect("create dir");
+            fs::write(&entry_path, "export default {}").expect("write index.ts");
+            fs::write(
+                package_root.join("package.json"),
+                serde_json::to_string_pretty(&json!({
+                    "name": "pkg",
+                    "version": "1.0.0",
+                    "pi": {
+                        "extensions": "extensions/index.ts"
+                    }
+                }))
+                .expect("serialize manifest"),
+            )
+            .expect("write manifest");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let sources = vec![package_root.to_string_lossy().to_string()];
+            let resolved = manager
+                .resolve_extension_sources(
+                    &sources,
+                    ResolveExtensionSourcesOptions {
+                        local: false,
+                        temporary: true,
+                    },
+                )
+                .await
+                .expect("resolve extension sources");
+
+            assert_eq!(resolved.extensions.len(), 1);
+            let entry = &resolved.extensions[0];
+            assert_eq!(entry.path, entry_path);
+            assert!(entry.enabled);
+            assert_eq!(entry.metadata.source, sources[0]);
+        });
+    }
+
+    #[test]
     fn test_resolve_extension_sources_errors_on_malformed_package_manifest() {
         run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -5479,6 +5529,34 @@ mod tests {
     }
 
     #[test]
+    fn read_pi_manifest_accepts_single_string_resource_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = json!({
+            "name": "test-pkg",
+            "version": "1.0.0",
+            "pi": {
+                "extensions": "ext/a.js",
+                "skills": "skills/foo.md",
+                "prompts": "prompts/intro.md",
+                "themes": "themes/default.json"
+            }
+        });
+        fs::write(
+            dir.path().join("package.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .expect("write");
+
+        let result = read_pi_manifest(dir.path()).expect("read manifest");
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert_eq!(result.extensions, Some(vec!["ext/a.js".to_string()]));
+        assert_eq!(result.skills, Some(vec!["skills/foo.md".to_string()]));
+        assert_eq!(result.prompts, Some(vec!["prompts/intro.md".to_string()]));
+        assert_eq!(result.themes, Some(vec!["themes/default.json".to_string()]));
+    }
+
+    #[test]
     fn read_pi_manifest_no_pi_field() {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(
@@ -5530,7 +5608,7 @@ mod tests {
     }
 
     #[test]
-    fn read_pi_manifest_errors_when_resource_entries_are_not_string_arrays() {
+    fn read_pi_manifest_errors_when_resource_entries_are_not_string_lists() {
         let dir = tempfile::tempdir().expect("tempdir");
         let manifest_path = dir.path().join("package.json");
         fs::write(
@@ -5542,7 +5620,7 @@ mod tests {
         let err = read_pi_manifest(dir.path()).expect_err("non-string manifest entries must error");
         let message = err.to_string();
         assert!(message.contains("Invalid package manifest"));
-        assert!(message.contains("`pi.extensions` must be an array of strings"));
+        assert!(message.contains("`pi.extensions` must be a string or array of strings"));
         assert!(message.contains(&manifest_path.display().to_string()));
     }
 
