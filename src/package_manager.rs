@@ -3315,6 +3315,10 @@ fn local_path_from_spec(spec: &str, cwd: &Path) -> PathBuf {
 fn file_url_local_path(path: &str) -> String {
     let path = path.trim();
 
+    if looks_like_windows_drive_absolute_path(path) {
+        return path.to_string();
+    }
+
     if let Some(stripped) = path
         .strip_prefix('/')
         .filter(|stripped| looks_like_windows_drive_absolute_path(stripped))
@@ -6003,6 +6007,14 @@ mod tests {
         );
         assert_eq!(
             local_path_from_spec("file:///C:\\packages\\demo", dir.path()),
+            PathBuf::from("C:\\packages\\demo")
+        );
+        assert_eq!(
+            local_path_from_spec("file://C:/packages/demo", dir.path()),
+            PathBuf::from("C:/packages/demo")
+        );
+        assert_eq!(
+            local_path_from_spec("file://C:\\packages\\demo", dir.path()),
             PathBuf::from("C:\\packages\\demo")
         );
     }
