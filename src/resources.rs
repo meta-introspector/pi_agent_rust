@@ -261,6 +261,7 @@ impl ResourceLoader {
         let cli_extensions = if cli.extension_paths.is_empty() {
             crate::package_manager::ResolvedPaths::default()
         } else {
+            validate_non_empty_cli_inputs(&cli.extension_paths, "extension source")?;
             Box::pin(manager.resolve_extension_sources(
                 &cli.extension_paths,
                 ResolveExtensionSourcesOptions {
@@ -271,6 +272,7 @@ impl ResourceLoader {
             .await?
         };
 
+        validate_non_empty_cli_inputs(&cli.skill_paths, "skill path")?;
         let explicit_skill_paths = dedupe_paths(
             cli.skill_paths
                 .iter()
@@ -279,6 +281,7 @@ impl ResourceLoader {
         );
         validate_explicit_resource_paths(&explicit_skill_paths, ExplicitResourceKind::Skill)?;
 
+        validate_non_empty_cli_inputs(&cli.prompt_paths, "prompt template path")?;
         let explicit_prompt_paths = dedupe_paths(
             cli.prompt_paths
                 .iter()
@@ -287,6 +290,7 @@ impl ResourceLoader {
         );
         validate_explicit_resource_paths(&explicit_prompt_paths, ExplicitResourceKind::Prompt)?;
 
+        validate_non_empty_cli_inputs(&cli.theme_paths, "theme path")?;
         let explicit_theme_paths = dedupe_paths(
             cli.theme_paths
                 .iter()
@@ -1820,6 +1824,15 @@ fn resolve_path(input: &str, cwd: &Path) -> PathBuf {
     }
 }
 
+fn validate_non_empty_cli_inputs(inputs: &[String], label: &str) -> Result<()> {
+    for input in inputs {
+        if input.trim().is_empty() {
+            return Err(Error::config(format!("Explicit {label} must be non-empty")));
+        }
+    }
+    Ok(())
+}
+
 fn is_under_path(target: &Path, root: &Path) -> bool {
     let Ok(root) = root.canonicalize() else {
         return false;
@@ -2361,6 +2374,64 @@ mod tests {
                 .expect_err("missing explicit CLI skill path should fail");
             assert!(
                 err.to_string().contains("does not exist"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_resource_loader_rejects_blank_cli_skill_path() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let config = Config::default();
+            let cli = ResourceCliOptions {
+                no_skills: false,
+                no_prompt_templates: true,
+                no_extensions: true,
+                no_themes: true,
+                skill_paths: vec!["   ".to_string()],
+                prompt_paths: Vec::new(),
+                extension_paths: Vec::new(),
+                theme_paths: Vec::new(),
+            };
+
+            let err = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
+                .await
+                .expect_err("blank explicit CLI skill path should fail");
+            assert!(
+                err.to_string()
+                    .contains("Explicit skill path must be non-empty"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_resource_loader_rejects_blank_cli_extension_source() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let config = Config::default();
+            let cli = ResourceCliOptions {
+                no_skills: true,
+                no_prompt_templates: true,
+                no_extensions: false,
+                no_themes: true,
+                skill_paths: Vec::new(),
+                prompt_paths: Vec::new(),
+                extension_paths: vec![" \t ".to_string()],
+                theme_paths: Vec::new(),
+            };
+
+            let err = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
+                .await
+                .expect_err("blank explicit CLI extension source should fail");
+            assert!(
+                err.to_string()
+                    .contains("Explicit extension source must be non-empty"),
                 "unexpected error: {err}"
             );
         });
