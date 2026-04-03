@@ -4213,6 +4213,7 @@ async fn ingest_bash_rpc_chunk(
 
     // Write new chunk to file if we have one
     let mut abandon_spill_file = false;
+    let mut close_spill_file = false;
     if let Some(file) = temp_file.as_mut() {
         if *total_bytes <= crate::tools::BASH_FILE_LIMIT_BYTES {
             use asupersync::io::AsyncWriteExt;
@@ -4224,12 +4225,15 @@ async fn ingest_bash_rpc_chunk(
             // Hard limit reached. Stop writing and close the file to release the FD.
             if !*spill_failed {
                 tracing::warn!("Bash output exceeded hard limit; stopping file log");
-                abandon_spill_file = true;
+                close_spill_file = true;
             }
         }
     }
     if abandon_spill_file {
         abandon_bash_rpc_spill_file(temp_file, temp_file_path, spill_failed);
+    }
+    if close_spill_file {
+        *temp_file = None;
     }
 
     // Update memory buffer

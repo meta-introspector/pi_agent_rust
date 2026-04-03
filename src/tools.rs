@@ -4647,6 +4647,7 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
         }
     }
 
+    let mut close_spill_file = false;
     if let Some(file) = state.temp_file.as_mut() {
         let mut abandon_spill_file = false;
         if state.total_bytes <= BASH_FILE_LIMIT_BYTES {
@@ -4658,12 +4659,15 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
             // Hard limit reached. Stop writing and close the file to release the FD.
             if !state.spill_failed {
                 tracing::warn!("Bash output exceeded hard limit; stopping file log");
-                abandon_spill_file = true;
+                close_spill_file = true;
             }
         }
         if abandon_spill_file {
             state.abandon_spill_file();
         }
+    }
+    if close_spill_file {
+        state.temp_file = None;
     }
 
     state.chunks_bytes = state.chunks_bytes.saturating_add(chunk.len());
