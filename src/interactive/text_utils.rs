@@ -1,3 +1,5 @@
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 pub(super) fn push_line(out: &mut String, line: &str) {
     if line.is_empty() {
         return;
@@ -13,8 +15,7 @@ pub(super) fn truncate(s: &str, max_len: usize) -> String {
         return String::new();
     }
 
-    let count = s.chars().count();
-    if count <= max_len {
+    if s.width() <= max_len {
         return s.to_string();
     }
 
@@ -24,7 +25,17 @@ pub(super) fn truncate(s: &str, max_len: usize) -> String {
 
     let take_len = max_len - 3;
     let mut out = String::with_capacity(max_len);
-    out.extend(s.chars().take(take_len));
+    let mut current_width = 0;
+    
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if current_width + w > take_len {
+            break;
+        }
+        out.push(c);
+        current_width += w;
+    }
+    
     out.push_str("...");
     out
 }

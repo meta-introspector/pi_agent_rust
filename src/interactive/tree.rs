@@ -578,14 +578,25 @@ fn build_tree_selector_rows(
         if max == 0 {
             return String::new();
         }
+        use unicode_width::UnicodeWidthChar;
         let mut out = String::with_capacity(max);
-        for (count, c) in text.chars().enumerate() {
-            if count == max {
-                out.pop();
+        let mut current_width = 0;
+        for c in text.chars() {
+            let c = if c == '\n' { ' ' } else { c };
+            let w = c.width().unwrap_or(0);
+            if current_width + w > max {
+                while current_width > max.saturating_sub(1) {
+                    if let Some(last) = out.pop() {
+                        current_width -= last.width().unwrap_or(0);
+                    } else {
+                        break;
+                    }
+                }
                 out.push('…');
                 return out;
             }
-            out.push(if c == '\n' { ' ' } else { c });
+            out.push(c);
+            current_width += w;
         }
         out
     }

@@ -1064,24 +1064,40 @@ impl PiApp {
                 AutocompleteItemKind::Path => "📂",
             };
 
+            use unicode_width::UnicodeWidthStr;
             let max_label_len = width.saturating_sub(6);
-            let label = if item.label.chars().count() > max_label_len {
-                let mut out = item
-                    .label
-                    .chars()
-                    .take(max_label_len.saturating_sub(1))
-                    .collect::<String>();
-                out.push('…');
+            let label_width = item.label.width();
+            let label = if label_width > max_label_len {
+                let mut out = String::with_capacity(max_label_len);
+                let mut current_width = 0;
+                for c in item.label.chars() {
+                    let w = c.width().unwrap_or(0);
+                    if current_width + w > max_label_len {
+                        while current_width > max_label_len.saturating_sub(1) {
+                            if let Some(last) = out.pop() {
+                                current_width -= last.width().unwrap_or(0);
+                            } else {
+                                break;
+                            }
+                        }
+                        out.push('…');
+                        break;
+                    }
+                    out.push(c);
+                    current_width += w;
+                }
                 out
             } else {
                 item.label.clone()
             };
 
-            let line_content = format!("{kind_icon} {label:<max_label_len$}");
+            let actual_label_width = label.width();
+            let padding = " ".repeat(max_label_len.saturating_sub(actual_label_width));
+            let line_content = format!("{kind_icon} {label}{padding}");
             let styled_line = if is_selected {
                 selected_style.render(&line_content)
             } else {
-                format!("{} {label:<max_label_len$}", kind_style.render(kind_icon))
+                format!("{} {label}{padding}", kind_style.render(kind_icon))
             };
 
             let _ = write!(
@@ -1094,15 +1110,31 @@ impl PiApp {
 
             if is_selected {
                 if let Some(desc) = &item.description {
-                    let truncated_desc = if desc.chars().count() > width.saturating_sub(4) {
-                        let mut out = desc
-                            .chars()
-                            .take(width.saturating_sub(5))
-                            .collect::<String>();
-                        out.push('…');
+                    let max_desc_len = width.saturating_sub(4);
+                    let desc_width = desc.width();
+                    let truncated_desc = if desc_width > max_desc_len {
+                        let mut out = String::with_capacity(max_desc_len);
+                        let mut current_width = 0;
+                        for c in desc.chars() {
+                            let c = if c == '\n' { ' ' } else { c };
+                            let w = c.width().unwrap_or(0);
+                            if current_width + w > max_desc_len {
+                                while current_width > max_desc_len.saturating_sub(1) {
+                                    if let Some(last) = out.pop() {
+                                        current_width -= last.width().unwrap_or(0);
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                out.push('…');
+                                break;
+                            }
+                            out.push(c);
+                            current_width += w;
+                        }
                         out
                     } else {
-                        desc.clone()
+                        desc.replace('\n', " ")
                     };
 
                     let _ = write!(
@@ -1113,7 +1145,7 @@ impl PiApp {
                         border_style.render(&format!(
                             "{:>pad$}│",
                             "",
-                            pad = width.saturating_sub(2).saturating_sub(truncated_desc.len())
+                            pad = width.saturating_sub(2).saturating_sub(truncated_desc.width())
                         ))
                     );
                 }
