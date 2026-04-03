@@ -6889,7 +6889,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bash_hard_limit_abandons_partial_spill_file() {
+    fn test_bash_hard_limit_retains_partial_spill_file() {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let spill_path = tmp.path().join("hard-limit-bash.log");
@@ -6910,12 +6910,12 @@ mod tests {
                 .await
                 .expect("hard-limit ingestion should still succeed");
 
-            assert!(bash_output.spill_failed);
+            assert!(!bash_output.spill_failed);
             assert!(bash_output.temp_file.is_none());
-            assert!(bash_output.temp_file_path.is_none());
+            assert!(bash_output.temp_file_path.is_some());
             assert!(
-                !spill_path.exists(),
-                "partial spill files must be discarded once the hard limit is reached"
+                spill_path.exists(),
+                "partial spill files must be retained once the hard limit is reached for diagnostics"
             );
         });
     }
