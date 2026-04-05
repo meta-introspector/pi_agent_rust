@@ -157,6 +157,9 @@ src/bin/test_time.rs
 # Codex cargo home (build cache)
 .codex-cargo-home/
 
+# Vendored dependencies (use cargo vendor locally; Nix fetches via Cargo.lock)
+vendor/
+
 # Compiler artifacts
 *.rlib
 
